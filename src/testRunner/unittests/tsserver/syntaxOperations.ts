@@ -15,7 +15,6 @@ namespace ts.projectSystem {
         }
 
         it("works when file is removed and added with different content", () => {
-            const projectRoot = "/user/username/projects/myproject";
             const app: File = {
                 path: `${projectRoot}/app.ts`,
                 content: "console.log('Hello world');"
@@ -60,13 +59,14 @@ describe("Test Suite 1", () => {
 
             const navBarResultUnitTest1 = navBarFull(session, unitTest1);
             host.deleteFile(unitTest1.path);
-            host.checkTimeoutQueueLengthAndRun(2);
-            checkProjectActualFiles(project, expectedFilesWithoutUnitTest1);
+            host.checkTimeoutQueueLengthAndRun(0);
+            checkProjectActualFiles(project, expectedFilesWithUnitTest1);
 
             session.executeCommandSeq<protocol.CloseRequest>({
                 command: protocol.CommandTypes.Close,
                 arguments: { file: unitTest1.path }
             });
+            host.checkTimeoutQueueLengthAndRun(2);
             checkProjectActualFiles(project, expectedFilesWithoutUnitTest1);
 
             const unitTest1WithChangedContent: File = {

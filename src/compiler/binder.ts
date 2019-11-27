@@ -1,3 +1,4 @@
+
 /* @internal */
 namespace ts {
     export const enum ModuleInstanceState {
@@ -13,11 +14,26 @@ namespace ts {
         referenced: boolean;
     }
 
-    export function getModuleInstanceState(node: ModuleDeclaration): ModuleInstanceState {
-        return node.body ? getModuleInstanceStateWorker(node.body) : ModuleInstanceState.Instantiated;
+    export function getModuleInstanceState(node: ModuleDeclaration, visited?: Map<ModuleInstanceState | undefined>): ModuleInstanceState {
+        if (node.body && !node.body.parent) {
+            // getModuleInstanceStateForAliasTarget needs to walk up the parent chain, so parent pointers must be set on this tree already
+            setParentPointers(node, node.body);
+        }
+        return node.body ? getModuleInstanceStateCached(node.body, visited) : ModuleInstanceState.Instantiated;
     }
 
-    function getModuleInstanceStateWorker(node: Node): ModuleInstanceState {
+    function getModuleInstanceStateCached(node: Node, visited = createMap<ModuleInstanceState | undefined>()) {
+        const nodeId = "" + getNodeId(node);
+        if (visited.has(nodeId)) {
+            return visited.get(nodeId) || ModuleInstanceState.NonInstantiated;
+        }
+        visited.set(nodeId, undefined);
+        const result = getModuleInstanceStateWorker(node, visited);
+        visited.set(nodeId, result);
+        return result;
+    }
+
+    function getModuleInstanceStateWorker(node: Node, visited: Map<ModuleInstanceState | undefined>): ModuleInstanceState {
         // A module is uninstantiated if it contains only
         switch (node.kind) {
             // 1. interface declarations, type alias declarations
@@ -37,11 +53,27 @@ namespace ts {
                     return ModuleInstanceState.NonInstantiated;
                 }
                 break;
-            // 4. other uninstantiated module declarations.
+            // 4. Export alias declarations pointing at only uninstantiated modules or things uninstantiated modules contain
+            case SyntaxKind.ExportDeclaration:
+                if (!(node as ExportDeclaration).moduleSpecifier && !!(node as ExportDeclaration).exportClause) {
+                    let state = ModuleInstanceState.NonInstantiated;
+                    for (const specifier of (node as ExportDeclaration).exportClause!.elements) {
+                        const specifierState = getModuleInstanceStateForAliasTarget(specifier, visited);
+                        if (specifierState > state) {
+                            state = specifierState;
+                        }
+                        if (state === ModuleInstanceState.Instantiated) {
+                            return state;
+                        }
+                    }
+                    return state;
+                }
+                break;
+            // 5. other uninstantiated module declarations.
             case SyntaxKind.ModuleBlock: {
                 let state = ModuleInstanceState.NonInstantiated;
                 forEachChild(node, n => {
-                    const childState = getModuleInstanceStateWorker(n);
+                    const childState = getModuleInstanceStateCached(n, visited);
                     switch (childState) {
                         case ModuleInstanceState.NonInstantiated:
                             // child is non-instantiated - continue searching
@@ -61,7 +93,7 @@ namespace ts {
                 return state;
             }
             case SyntaxKind.ModuleDeclaration:
-                return getModuleInstanceState(node as ModuleDeclaration);
+                return getModuleInstanceState(node as ModuleDeclaration, visited);
             case SyntaxKind.Identifier:
                 // Only jsdoc typedef definition can exist in jsdoc namespace, and it should
                 // be considered the same as type alias
@@ -70,6 +102,36 @@ namespace ts {
                 }
         }
         return ModuleInstanceState.Instantiated;
+    }
+
+    function getModuleInstanceStateForAliasTarget(specifier: ExportSpecifier, visited: Map<ModuleInstanceState | undefined>) {
+        const name = specifier.propertyName || specifier.name;
+        let p: Node | undefined = specifier.parent;
+        while (p) {
+            if (isBlock(p) || isModuleBlock(p) || isSourceFile(p)) {
+                const statements = p.statements;
+                let found: ModuleInstanceState | undefined;
+                for (const statement of statements) {
+                    if (nodeHasName(statement, name)) {
+                        if (!statement.parent) {
+                            setParentPointers(p, statement);
+                        }
+                        const state = getModuleInstanceStateCached(statement, visited);
+                        if (found === undefined || state > found) {
+                            found = state;
+                        }
+                        if (found === ModuleInstanceState.Instantiated) {
+                            return found;
+                        }
+                    }
+                }
+                if (found !== undefined) {
+                    return found;
+                }
+            }
+            p = p.parent;
+        }
+        return ModuleInstanceState.Instantiated; // Couldn't locate, assume could refer to a value
     }
 
     const enum ContainerFlags {
@@ -100,13 +162,18 @@ namespace ts {
         IsObjectLiteralOrClassExpressionMethod = 1 << 7,
     }
 
-    let flowNodeCreated: <T extends FlowNode>(node: T) => T = identity;
+    function initFlowNode<T extends FlowNode>(node: T) {
+        Debug.attachFlowNodeDebugInfo(node);
+        return node;
+    }
 
     const binder = createBinder();
 
     export function bindSourceFile(file: SourceFile, options: CompilerOptions) {
         performance.mark("beforeBind");
+        perfLogger.logStartBindFile("" + file.fileName);
         binder(file, options);
+        perfLogger.logStopBindFile();
         performance.mark("afterBind");
         performance.measure("Bind", "beforeBind", "afterBind");
     }
@@ -120,7 +187,7 @@ namespace ts {
         let thisParentContainer: Node; // Container one level up
         let blockScopeContainer: Node;
         let lastContainer: Node;
-        let delayedTypeAliases: (JSDocTypedefTag | JSDocCallbackTag)[];
+        let delayedTypeAliases: (JSDocTypedefTag | JSDocCallbackTag | JSDocEnumTag)[];
         let seenThisKeyword: boolean;
 
         // state used by control flow analysis
@@ -130,6 +197,7 @@ namespace ts {
         let currentReturnTarget: FlowLabel | undefined;
         let currentTrueTarget: FlowLabel | undefined;
         let currentFalseTarget: FlowLabel | undefined;
+        let currentExceptionTarget: FlowLabel | undefined;
         let preSwitchCaseFlow: FlowNode | undefined;
         let activeLabels: ActiveLabel[] | undefined;
         let hasExplicitReturn: boolean;
@@ -145,7 +213,7 @@ namespace ts {
 
         let symbolCount = 0;
 
-        let Symbol: new (flags: SymbolFlags, name: __String) => Symbol; // tslint:disable-line variable-name
+        let Symbol: new (flags: SymbolFlags, name: __String) => Symbol;
         let classifiableNames: UnderscoreEscapedMap<true>;
 
         const unreachableFlow: FlowNode = { flags: FlowFlags.Unreachable };
@@ -175,6 +243,10 @@ namespace ts {
 
             Symbol = objectAllocator.getSymbolConstructor();
 
+            // Attach debugging information if necessary
+            Debug.attachFlowNodeDebugInfo(unreachableFlow);
+            Debug.attachFlowNodeDebugInfo(reportedUnreachableFlow);
+
             if (!file.locals) {
                 bind(file);
                 file.symbolCount = symbolCount;
@@ -198,6 +270,7 @@ namespace ts {
             currentReturnTarget = undefined;
             currentTrueTarget = undefined;
             currentFalseTarget = undefined;
+            currentExceptionTarget = undefined;
             activeLabels = undefined!;
             hasExplicitReturn = false;
             emitFlags = NodeFlags.None;
@@ -225,7 +298,7 @@ namespace ts {
             symbol.flags |= symbolFlags;
 
             node.symbol = symbol;
-            symbol.declarations = append(symbol.declarations, node);
+            symbol.declarations = appendIfUnique(symbol.declarations, node);
 
             if (symbolFlags & (SymbolFlags.Class | SymbolFlags.Enum | SymbolFlags.Module | SymbolFlags.Variable) && !symbol.exports) {
                 symbol.exports = createSymbolTable();
@@ -274,9 +347,15 @@ namespace ts {
                     if (isStringOrNumericLiteralLike(nameExpression)) {
                         return escapeLeadingUnderscores(nameExpression.text);
                     }
+                    if (isSignedNumericLiteral(nameExpression)) {
+                        return tokenToString(nameExpression.operator) + nameExpression.operand.text as __String;
+                    }
 
                     Debug.assert(isWellKnownSymbolSyntactically(nameExpression));
                     return getPropertyNameForKnownSymbolName(idText((<PropertyAccessExpression>nameExpression).name));
+                }
+                if (isWellKnownSymbolSyntactically(name)) {
+                    return getPropertyNameForKnownSymbolName(idText(name.name));
                 }
                 return isPropertyNameLiteral(name) ? getEscapedTextOfIdentifierOrLiteral(name) : undefined;
             }
@@ -403,13 +482,15 @@ namespace ts {
                             messageNeedsName = false;
                         }
 
-                        if (symbol.declarations && symbol.declarations.length) {
+                        let multipleDefaultExports = false;
+                        if (length(symbol.declarations)) {
                             // If the current node is a default export of some sort, then check if
                             // there are any other default exports that we need to error on.
                             // We'll know whether we have other default exports depending on if `symbol` already has a declaration list set.
                             if (isDefaultExport) {
                                 message = Diagnostics.A_module_cannot_have_multiple_default_exports;
                                 messageNeedsName = false;
+                                multipleDefaultExports = true;
                             }
                             else {
                                 // This is to properly report an error in the case "export default { }" is after export default of class declaration or function declaration.
@@ -420,15 +501,26 @@ namespace ts {
                                     (node.kind === SyntaxKind.ExportAssignment && !(<ExportAssignment>node).isExportEquals)) {
                                     message = Diagnostics.A_module_cannot_have_multiple_default_exports;
                                     messageNeedsName = false;
+                                    multipleDefaultExports = true;
                                 }
                             }
                         }
 
-                        const addError = (decl: Declaration): void => {
-                            file.bindDiagnostics.push(createDiagnosticForNode(getNameOfDeclaration(decl) || decl, message, messageNeedsName ? getDisplayName(decl) : undefined));
-                        };
-                        forEach(symbol.declarations, addError);
-                        addError(node);
+                        const declarationName = getNameOfDeclaration(node) || node;
+                        const relatedInformation: DiagnosticRelatedInformation[] = [];
+                        forEach(symbol.declarations, (declaration, index) => {
+                            const decl = getNameOfDeclaration(declaration) || declaration;
+                            const diag = createDiagnosticForNode(decl, message, messageNeedsName ? getDisplayName(declaration) : undefined);
+                            file.bindDiagnostics.push(
+                                multipleDefaultExports ? addRelatedInfo(diag, createDiagnosticForNode(declarationName, index === 0 ? Diagnostics.Another_export_default_is_here : Diagnostics.and_here)) : diag
+                            );
+                            if (multipleDefaultExports) {
+                                relatedInformation.push(createDiagnosticForNode(decl, Diagnostics.The_first_export_default_is_here));
+                            }
+                        });
+
+                        const diag = createDiagnosticForNode(declarationName, message, messageNeedsName ? getDisplayName(node) : undefined);
+                        file.bindDiagnostics.push(multipleDefaultExports ? addRelatedInfo(diag, ...relatedInformation) : diag);
 
                         symbol = createSymbol(SymbolFlags.None, name);
                     }
@@ -474,11 +566,11 @@ namespace ts {
                 //       and should never be merged directly with other augmentation, and the latter case would be possible if automatic merge is allowed.
                 if (isJSDocTypeAlias(node)) Debug.assert(isInJSFile(node)); // We shouldn't add symbols for JSDoc nodes if not in a JS file.
                 if ((!isAmbientModule(node) && (hasExportModifier || container.flags & NodeFlags.ExportContext)) || isJSDocTypeAlias(node)) {
-                    if (hasModifier(node, ModifierFlags.Default) && !getDeclarationName(node)) {
+                    if (!container.locals || (hasModifier(node, ModifierFlags.Default) && !getDeclarationName(node))) {
                         return declareSymbol(container.symbol.exports!, container.symbol, node, symbolFlags, symbolExcludes); // No local symbol for an unnamed default!
                     }
                     const exportKind = symbolFlags & SymbolFlags.Value ? SymbolFlags.ExportValue : 0;
-                    const local = declareSymbol(container.locals!, /*parent*/ undefined, node, exportKind, symbolExcludes);
+                    const local = declareSymbol(container.locals, /*parent*/ undefined, node, exportKind, symbolExcludes);
                     local.exportSymbol = declareSymbol(container.symbol.exports!, container.symbol, node, symbolFlags, symbolExcludes);
                     node.localSymbol = local;
                     return local;
@@ -532,11 +624,11 @@ namespace ts {
                 blockScopeContainer.locals = undefined;
             }
             if (containerFlags & ContainerFlags.IsControlFlowContainer) {
-                const saveFlowNodeCreated = flowNodeCreated;
                 const saveCurrentFlow = currentFlow;
                 const saveBreakTarget = currentBreakTarget;
                 const saveContinueTarget = currentContinueTarget;
                 const saveReturnTarget = currentReturnTarget;
+                const saveExceptionTarget = currentExceptionTarget;
                 const saveActiveLabels = activeLabels;
                 const saveHasExplicitReturn = hasExplicitReturn;
                 const isIIFE = containerFlags & ContainerFlags.IsFunctionExpression && !hasModifier(node, ModifierFlags.Async) &&
@@ -544,25 +636,26 @@ namespace ts {
                 // A non-async, non-generator IIFE is considered part of the containing control flow. Return statements behave
                 // similarly to break statements that exit to a label just past the statement body.
                 if (!isIIFE) {
-                    currentFlow = { flags: FlowFlags.Start };
+                    currentFlow = initFlowNode({ flags: FlowFlags.Start });
                     if (containerFlags & (ContainerFlags.IsFunctionExpression | ContainerFlags.IsObjectLiteralOrClassExpressionMethod)) {
-                        currentFlow.container = <FunctionExpression | ArrowFunction | MethodDeclaration>node;
+                        currentFlow.node = <FunctionExpression | ArrowFunction | MethodDeclaration>node;
                     }
                 }
                 // We create a return control flow graph for IIFEs and constructors. For constructors
                 // we use the return control flow graph in strict property initialization checks.
                 currentReturnTarget = isIIFE || node.kind === SyntaxKind.Constructor ? createBranchLabel() : undefined;
+                currentExceptionTarget = undefined;
                 currentBreakTarget = undefined;
                 currentContinueTarget = undefined;
                 activeLabels = undefined;
                 hasExplicitReturn = false;
-                flowNodeCreated = identity;
                 bindChildren(node);
                 // Reset all reachability check related flags on node (for incremental scenarios)
                 node.flags &= ~NodeFlags.ReachabilityAndEmitFlags;
                 if (!(currentFlow.flags & FlowFlags.Unreachable) && containerFlags & ContainerFlags.IsFunctionLike && nodeIsPresent((<FunctionLikeDeclaration>node).body)) {
                     node.flags |= NodeFlags.HasImplicitReturn;
                     if (hasExplicitReturn) node.flags |= NodeFlags.HasExplicitReturn;
+                    (<FunctionLikeDeclaration>node).endFlowNode = currentFlow;
                 }
                 if (node.kind === SyntaxKind.SourceFile) {
                     node.flags |= emitFlags;
@@ -581,9 +674,9 @@ namespace ts {
                 currentBreakTarget = saveBreakTarget;
                 currentContinueTarget = saveContinueTarget;
                 currentReturnTarget = saveReturnTarget;
+                currentExceptionTarget = saveExceptionTarget;
                 activeLabels = saveActiveLabels;
                 hasExplicitReturn = saveHasExplicitReturn;
-                flowNodeCreated = saveFlowNodeCreated;
             }
             else if (containerFlags & ContainerFlags.IsInterface) {
                 seenThisKeyword = false;
@@ -653,6 +746,9 @@ namespace ts {
                 bindJSDoc(node);
                 return;
             }
+            if (node.kind >= SyntaxKind.FirstStatement && node.kind <= SyntaxKind.LastStatement && !options.allowUnreachableCode) {
+                node.flowNode = currentFlow;
+            }
             switch (node.kind) {
                 case SyntaxKind.WhileStatement:
                     bindWhileStatement(<WhileStatement>node);
@@ -690,6 +786,9 @@ namespace ts {
                 case SyntaxKind.CaseClause:
                     bindCaseClause(<CaseClause>node);
                     break;
+                case SyntaxKind.ExpressionStatement:
+                    bindExpressionStatement(<ExpressionStatement>node);
+                    break;
                 case SyntaxKind.LabeledStatement:
                     bindLabeledStatement(<LabeledStatement>node);
                     break;
@@ -711,12 +810,17 @@ namespace ts {
                 case SyntaxKind.VariableDeclaration:
                     bindVariableDeclarationFlow(<VariableDeclaration>node);
                     break;
+                case SyntaxKind.PropertyAccessExpression:
+                case SyntaxKind.ElementAccessExpression:
+                    bindAccessExpressionFlow(<AccessExpression>node);
+                    break;
                 case SyntaxKind.CallExpression:
                     bindCallExpressionFlow(<CallExpression>node);
                     break;
                 case SyntaxKind.JSDocTypedefTag:
                 case SyntaxKind.JSDocCallbackTag:
-                    bindJSDocTypeAlias(node as JSDocTypedefTag | JSDocCallbackTag);
+                case SyntaxKind.JSDocEnumTag:
+                    bindJSDocTypeAlias(node as JSDocTypedefTag | JSDocCallbackTag | JSDocEnumTag);
                     break;
                 // In source files and blocks, bind functions first to match hoisting that occurs at runtime
                 case SyntaxKind.SourceFile: {
@@ -759,9 +863,8 @@ namespace ts {
         function isNarrowableReference(expr: Expression): boolean {
             return expr.kind === SyntaxKind.Identifier || expr.kind === SyntaxKind.ThisKeyword || expr.kind === SyntaxKind.SuperKeyword ||
                 (isPropertyAccessExpression(expr) || isNonNullExpression(expr) || isParenthesizedExpression(expr)) && isNarrowableReference(expr.expression) ||
-                isElementAccessExpression(expr) && expr.argumentExpression &&
-                (isStringLiteral(expr.argumentExpression) || isNumericLiteral(expr.argumentExpression)) &&
-                isNarrowableReference(expr.expression);
+                isElementAccessExpression(expr) && isStringOrNumericLiteralLike(expr.argumentExpression) && isNarrowableReference(expr.expression) ||
+                isOptionalChain(expr);
         }
 
         function hasNarrowableArgument(expr: CallExpression) {
@@ -823,17 +926,11 @@ namespace ts {
         }
 
         function createBranchLabel(): FlowLabel {
-            return {
-                flags: FlowFlags.BranchLabel,
-                antecedents: undefined
-            };
+            return initFlowNode({ flags: FlowFlags.BranchLabel, antecedents: undefined });
         }
 
         function createLoopLabel(): FlowLabel {
-            return {
-                flags: FlowFlags.LoopLabel,
-                antecedents: undefined
-            };
+            return initFlowNode({ flags: FlowFlags.LoopLabel, antecedents: undefined });
         }
 
         function setFlowNodeReferenced(flow: FlowNode) {
@@ -855,34 +952,35 @@ namespace ts {
             if (!expression) {
                 return flags & FlowFlags.TrueCondition ? antecedent : unreachableFlow;
             }
-            if (expression.kind === SyntaxKind.TrueKeyword && flags & FlowFlags.FalseCondition ||
-                expression.kind === SyntaxKind.FalseKeyword && flags & FlowFlags.TrueCondition) {
+            if ((expression.kind === SyntaxKind.TrueKeyword && flags & FlowFlags.FalseCondition ||
+                expression.kind === SyntaxKind.FalseKeyword && flags & FlowFlags.TrueCondition) &&
+                !isExpressionOfOptionalChainRoot(expression) && !isNullishCoalesce(expression.parent)) {
                 return unreachableFlow;
             }
             if (!isNarrowingExpression(expression)) {
                 return antecedent;
             }
             setFlowNodeReferenced(antecedent);
-            return flowNodeCreated({ flags, expression, antecedent });
+            return initFlowNode({ flags, antecedent, node: expression });
         }
 
         function createFlowSwitchClause(antecedent: FlowNode, switchStatement: SwitchStatement, clauseStart: number, clauseEnd: number): FlowNode {
-            if (!isNarrowingExpression(switchStatement.expression)) {
-                return antecedent;
+            setFlowNodeReferenced(antecedent);
+            return initFlowNode({ flags: FlowFlags.SwitchClause, antecedent, switchStatement, clauseStart, clauseEnd });
+        }
+
+        function createFlowMutation(flags: FlowFlags, antecedent: FlowNode, node: Node): FlowNode {
+            setFlowNodeReferenced(antecedent);
+            const result = initFlowNode({ flags, antecedent, node });
+            if (currentExceptionTarget) {
+                addAntecedent(currentExceptionTarget, result);
             }
-            setFlowNodeReferenced(antecedent);
-            return flowNodeCreated({ flags: FlowFlags.SwitchClause, switchStatement, clauseStart, clauseEnd, antecedent });
+            return result;
         }
 
-        function createFlowAssignment(antecedent: FlowNode, node: Expression | VariableDeclaration | BindingElement): FlowNode {
+        function createFlowCall(antecedent: FlowNode, node: CallExpression): FlowNode {
             setFlowNodeReferenced(antecedent);
-            return flowNodeCreated({ flags: FlowFlags.Assignment, antecedent, node });
-        }
-
-        function createFlowArrayMutation(antecedent: FlowNode, node: CallExpression | BinaryExpression): FlowNode {
-            setFlowNodeReferenced(antecedent);
-            const res: FlowArrayMutation = flowNodeCreated({ flags: FlowFlags.ArrayMutation, antecedent, node });
-            return res;
+            return initFlowNode({ flags: FlowFlags.Call, antecedent, node });
         }
 
         function finishFlowLabel(flow: FlowLabel): FlowNode {
@@ -921,29 +1019,35 @@ namespace ts {
                 else {
                     return node.kind === SyntaxKind.BinaryExpression && (
                         (<BinaryExpression>node).operatorToken.kind === SyntaxKind.AmpersandAmpersandToken ||
-                        (<BinaryExpression>node).operatorToken.kind === SyntaxKind.BarBarToken);
+                        (<BinaryExpression>node).operatorToken.kind === SyntaxKind.BarBarToken ||
+                        (<BinaryExpression>node).operatorToken.kind === SyntaxKind.QuestionQuestionToken);
                 }
             }
         }
 
         function isTopLevelLogicalExpression(node: Node): boolean {
-            while (node.parent.kind === SyntaxKind.ParenthesizedExpression ||
-                node.parent.kind === SyntaxKind.PrefixUnaryExpression &&
-                (<PrefixUnaryExpression>node.parent).operator === SyntaxKind.ExclamationToken) {
+            while (isParenthesizedExpression(node.parent) ||
+                isPrefixUnaryExpression(node.parent) && node.parent.operator === SyntaxKind.ExclamationToken) {
                 node = node.parent;
             }
-            return !isStatementCondition(node) && !isLogicalExpression(node.parent);
+            return !isStatementCondition(node) &&
+                !isLogicalExpression(node.parent) &&
+                !(isOptionalChain(node.parent) && node.parent.expression === node);
+        }
+
+        function doWithConditionalBranches<T>(action: (value: T) => void, value: T, trueTarget: FlowLabel, falseTarget: FlowLabel) {
+            const savedTrueTarget = currentTrueTarget;
+            const savedFalseTarget = currentFalseTarget;
+            currentTrueTarget = trueTarget;
+            currentFalseTarget = falseTarget;
+            action(value);
+            currentTrueTarget = savedTrueTarget;
+            currentFalseTarget = savedFalseTarget;
         }
 
         function bindCondition(node: Expression | undefined, trueTarget: FlowLabel, falseTarget: FlowLabel) {
-            const saveTrueTarget = currentTrueTarget;
-            const saveFalseTarget = currentFalseTarget;
-            currentTrueTarget = trueTarget;
-            currentFalseTarget = falseTarget;
-            bind(node);
-            currentTrueTarget = saveTrueTarget;
-            currentFalseTarget = saveFalseTarget;
-            if (!node || !isLogicalExpression(node)) {
+            doWithConditionalBranches(bind, node, trueTarget, falseTarget);
+            if (!node || !isLogicalExpression(node) && !(isOptionalChain(node) && isOutermostOptionalChain(node))) {
                 addAntecedent(trueTarget, createFlowCondition(FlowFlags.TrueCondition, currentFlow, node));
                 addAntecedent(falseTarget, createFlowCondition(FlowFlags.FalseCondition, currentFlow, node));
             }
@@ -1008,12 +1112,12 @@ namespace ts {
         function bindForInOrForOfStatement(node: ForInOrOfStatement): void {
             const preLoopLabel = createLoopLabel();
             const postLoopLabel = createBranchLabel();
+            bind(node.expression);
             addAntecedent(preLoopLabel, currentFlow);
             currentFlow = preLoopLabel;
             if (node.kind === SyntaxKind.ForOfStatement) {
                 bind(node.awaitModifier);
             }
-            bind(node.expression);
             addAntecedent(postLoopLabel, currentFlow);
             bind(node.initializer);
             if (node.initializer.kind !== SyntaxKind.VariableDeclarationList) {
@@ -1084,89 +1188,56 @@ namespace ts {
 
         function bindTryStatement(node: TryStatement): void {
             const preFinallyLabel = createBranchLabel();
-            const preTryFlow = currentFlow;
-            const tryPriors: FlowNode[] = [];
-            const oldFlowNodeCreated = flowNodeCreated;
-            // We hook the creation of all flow nodes within the `try` scope and store them so we can add _all_ of them
-            // as possible antecedents of the start of the `catch` or `finally` blocks.
-            // Don't bother intercepting the call if there's no finally or catch block that needs the information
-            if (node.catchClause || node.finallyBlock) {
-                flowNodeCreated = node => (tryPriors.push(node), node);
-            }
+            // We conservatively assume that *any* code in the try block can cause an exception, but we only need
+            // to track code that causes mutations (because only mutations widen the possible control flow type of
+            // a variable). The currentExceptionTarget is the target label for control flows that result from
+            // exceptions. We add all mutation flow nodes as antecedents of this label such that we can analyze them
+            // as possible antecedents of the start of catch or finally blocks. Furthermore, we add the current
+            // control flow to represent exceptions that occur before any mutations.
+            const saveExceptionTarget = currentExceptionTarget;
+            currentExceptionTarget = createBranchLabel();
+            addAntecedent(currentExceptionTarget, currentFlow);
             bind(node.tryBlock);
-            flowNodeCreated = oldFlowNodeCreated;
             addAntecedent(preFinallyLabel, currentFlow);
-
             const flowAfterTry = currentFlow;
             let flowAfterCatch = unreachableFlow;
-
             if (node.catchClause) {
-                currentFlow = preTryFlow;
-                if (tryPriors.length) {
-                    const preCatchFlow = createBranchLabel();
-                    addAntecedent(preCatchFlow, currentFlow);
-                    for (const p of tryPriors) {
-                        addAntecedent(preCatchFlow, p);
-                    }
-                    currentFlow = finishFlowLabel(preCatchFlow);
-                }
-
+                // Start of catch clause is the target of exceptions from try block.
+                currentFlow = finishFlowLabel(currentExceptionTarget);
+                // The currentExceptionTarget now represents control flows from exceptions in the catch clause.
+                // Effectively, in a try-catch-finally, if an exception occurs in the try block, the catch block
+                // acts like a second try block.
+                currentExceptionTarget = createBranchLabel();
+                addAntecedent(currentExceptionTarget, currentFlow);
                 bind(node.catchClause);
                 addAntecedent(preFinallyLabel, currentFlow);
-
                 flowAfterCatch = currentFlow;
             }
+            const exceptionTarget = finishFlowLabel(currentExceptionTarget);
+            currentExceptionTarget = saveExceptionTarget;
             if (node.finallyBlock) {
-                // We add the nodes within the `try` block to the `finally`'s antecedents if there's no catch block
-                // (If there is a `catch` block, it will have all these antecedents instead, and the `finally` will
-                // have the end of the `try` block and the end of the `catch` block)
-                if (!node.catchClause) {
-                    if (tryPriors.length) {
-                        for (const p of tryPriors) {
-                            addAntecedent(preFinallyLabel, p);
-                        }
-                    }
-                }
-
-                // in finally flow is combined from pre-try/flow from try/flow from catch
-                // pre-flow is necessary to make sure that finally is reachable even if finally flows in both try and finally blocks are unreachable
-
-                // also for finally blocks we inject two extra edges into the flow graph.
-                // first -> edge that connects pre-try flow with the label at the beginning of the finally block, it has lock associated with it
-                // second -> edge that represents post-finally flow.
-                // these edges are used in following scenario:
-                // let a; (1)
-                // try { a = someOperation(); (2)}
-                // finally { (3) console.log(a) } (4)
-                // (5) a
-
-                // flow graph for this case looks roughly like this (arrows show ):
-                // (1-pre-try-flow) <--.. <-- (2-post-try-flow)
-                //  ^                                ^
-                //  |*****(3-pre-finally-label) -----|
-                //                ^
-                //                |-- ... <-- (4-post-finally-label) <--- (5)
-                // In case when we walk the flow starting from inside the finally block we want to take edge '*****' into account
-                // since it ensures that finally is always reachable. However when we start outside the finally block and go through label (5)
-                // then edge '*****' should be discarded because label 4 is only reachable if post-finally label-4 is reachable
-                // Simply speaking code inside finally block is treated as reachable as pre-try-flow
-                // since we conservatively assume that any line in try block can throw or return in which case we'll enter finally.
-                // However code after finally is reachable only if control flow was not abrupted in try/catch or finally blocks - it should be composed from
-                // final flows of these blocks without taking pre-try flow into account.
-                //
-                // extra edges that we inject allows to control this behavior
-                // if when walking the flow we step on post-finally edge - we can mark matching pre-finally edge as locked so it will be skipped.
-                const preFinallyFlow: PreFinallyFlow = { flags: FlowFlags.PreFinally, antecedent: preTryFlow, lock: {} };
+                // Possible ways control can reach the finally block:
+                // 1) Normal completion of try block of a try-finally or try-catch-finally
+                // 2) Normal completion of catch block (following exception in try block) of a try-catch-finally
+                // 3) Exception in try block of a try-finally
+                // 4) Exception in catch block of a try-catch-finally
+                // When analyzing a control flow graph that starts inside a finally block we want to consider all
+                // four possibilities above. However, when analyzing a control flow graph that starts outside (past)
+                // the finally block, we only want to consider the first two (if we're past a finally block then it
+                // must have completed normally). To make this possible, we inject two extra nodes into the control
+                // flow graph: An after-finally with an antecedent of the control flow at the end of the finally
+                // block, and a pre-finally with an antecedent that represents all exceptional control flows. The
+                // 'lock' property of the pre-finally references the after-finally, and the after-finally has a
+                // boolean 'locked' property that we set to true when analyzing a control flow that contained the
+                // the after-finally node. When the lock associated with a pre-finally is locked, the antecedent of
+                // the pre-finally (i.e. the exceptional control flows) are skipped.
+                const preFinallyFlow: PreFinallyFlow = initFlowNode({ flags: FlowFlags.PreFinally, antecedent: exceptionTarget, lock: {} });
                 addAntecedent(preFinallyLabel, preFinallyFlow);
-
                 currentFlow = finishFlowLabel(preFinallyLabel);
                 bind(node.finallyBlock);
-                // if flow after finally is unreachable - keep it
-                // otherwise check if flows after try and after catch are unreachable
-                // if yes - convert current flow to unreachable
-                // i.e.
-                // try { return "1" } finally { console.log(1); }
-                // console.log(2); // this line should be unreachable even if flow falls out of finally block
+                // If the end of the finally block is reachable, but the end of the try and catch blocks are not,
+                // convert the current flow to unreachable. For example, 'try { return 1; } finally { ... }' should
+                // result in an unreachable current control flow.
                 if (!(currentFlow.flags & FlowFlags.Unreachable)) {
                     if ((flowAfterTry.flags & FlowFlags.Unreachable) && (flowAfterCatch.flags & FlowFlags.Unreachable)) {
                         currentFlow = flowAfterTry === reportedUnreachableFlow || flowAfterCatch === reportedUnreachableFlow
@@ -1175,7 +1246,7 @@ namespace ts {
                     }
                 }
                 if (!(currentFlow.flags & FlowFlags.Unreachable)) {
-                    const afterFinallyFlow: AfterFinallyFlow = flowNodeCreated({ flags: FlowFlags.AfterFinally, antecedent: currentFlow });
+                    const afterFinallyFlow: AfterFinallyFlow = initFlowNode({ flags: FlowFlags.AfterFinally, antecedent: currentFlow });
                     preFinallyFlow.lock = afterFinallyFlow;
                     currentFlow = afterFinallyFlow;
                 }
@@ -1196,7 +1267,8 @@ namespace ts {
             addAntecedent(postSwitchLabel, currentFlow);
             const hasDefault = forEach(node.caseBlock.clauses, c => c.kind === SyntaxKind.DefaultClause);
             // We mark a switch statement as possibly exhaustive if it has no default clause and if all
-            // case clauses have unreachable end points (e.g. they all return).
+            // case clauses have unreachable end points (e.g. they all return). Note, we no longer need
+            // this property in control flow analysis, it's there only for backwards compatibility.
             node.possiblyExhaustive = !hasDefault && !postSwitchLabel.antecedents;
             if (!hasDefault) {
                 addAntecedent(postSwitchLabel, createFlowSwitchClause(preSwitchCaseFlow, node, 0, 0));
@@ -1210,6 +1282,7 @@ namespace ts {
             const savedSubtreeTransformFlags = subtreeTransformFlags;
             subtreeTransformFlags = 0;
             const clauses = node.clauses;
+            const isNarrowingSwitch = isNarrowingExpression(node.parent.expression);
             let fallthroughFlow = unreachableFlow;
             for (let i = 0; i < clauses.length; i++) {
                 const clauseStart = i;
@@ -1218,14 +1291,14 @@ namespace ts {
                     i++;
                 }
                 const preCaseLabel = createBranchLabel();
-                addAntecedent(preCaseLabel, createFlowSwitchClause(preSwitchCaseFlow!, node.parent, clauseStart, i + 1));
+                addAntecedent(preCaseLabel, isNarrowingSwitch ? createFlowSwitchClause(preSwitchCaseFlow!, node.parent, clauseStart, i + 1) : preSwitchCaseFlow!);
                 addAntecedent(preCaseLabel, fallthroughFlow);
                 currentFlow = finishFlowLabel(preCaseLabel);
                 const clause = clauses[i];
                 bind(clause);
                 fallthroughFlow = currentFlow;
                 if (!(currentFlow.flags & FlowFlags.Unreachable) && i !== clauses.length - 1 && options.noFallthroughCasesInSwitch) {
-                    errorOnFirstToken(clause, Diagnostics.Fallthrough_case_in_switch);
+                    clause.fallthroughFlowNode = currentFlow;
                 }
             }
             clauses.transformFlags = subtreeTransformFlags | TransformFlags.HasComputedFlags;
@@ -1253,6 +1326,18 @@ namespace ts {
 
         function popActiveLabel() {
             activeLabels!.pop();
+        }
+
+        function bindExpressionStatement(node: ExpressionStatement): void {
+            bind(node.expression);
+            // A top level call expression with a dotted function name and at least one argument
+            // is potentially an assertion and is therefore included in the control flow.
+            if (node.expression.kind === SyntaxKind.CallExpression) {
+                const call = <CallExpression>node.expression;
+                if (isDottedName(call.expression)) {
+                    currentFlow = createFlowCall(currentFlow, call);
+                }
+            }
         }
 
         function bindLabeledStatement(node: LabeledStatement): void {
@@ -1284,7 +1369,7 @@ namespace ts {
 
         function bindAssignmentTargetFlow(node: Expression) {
             if (isNarrowableReference(node)) {
-                currentFlow = createFlowAssignment(currentFlow, node);
+                currentFlow = createFlowMutation(FlowFlags.Assignment, currentFlow, node);
             }
             else if (node.kind === SyntaxKind.ArrayLiteralExpression) {
                 for (const e of (<ArrayLiteralExpression>node).elements) {
@@ -1350,7 +1435,7 @@ namespace ts {
 
         function bindBinaryExpressionFlow(node: BinaryExpression) {
             const operator = node.operatorToken.kind;
-            if (operator === SyntaxKind.AmpersandAmpersandToken || operator === SyntaxKind.BarBarToken) {
+            if (operator === SyntaxKind.AmpersandAmpersandToken || operator === SyntaxKind.BarBarToken || operator === SyntaxKind.QuestionQuestionToken) {
                 if (isTopLevelLogicalExpression(node)) {
                     const postExpressionLabel = createBranchLabel();
                     bindLogicalExpression(node, postExpressionLabel, postExpressionLabel);
@@ -1367,7 +1452,7 @@ namespace ts {
                     if (operator === SyntaxKind.EqualsToken && node.left.kind === SyntaxKind.ElementAccessExpression) {
                         const elementAccess = <ElementAccessExpression>node.left;
                         if (isNarrowableOperand(elementAccess.expression)) {
-                            currentFlow = createFlowArrayMutation(currentFlow, node);
+                            currentFlow = createFlowMutation(FlowFlags.ArrayMutation, currentFlow, node);
                         }
                     }
                 }
@@ -1405,7 +1490,7 @@ namespace ts {
                 }
             }
             else {
-                currentFlow = createFlowAssignment(currentFlow, node);
+                currentFlow = createFlowMutation(FlowFlags.Assignment, currentFlow, node);
             }
         }
 
@@ -1416,33 +1501,111 @@ namespace ts {
             }
         }
 
-        function bindJSDocTypeAlias(node: JSDocTypedefTag | JSDocCallbackTag) {
+        function bindJSDocTypeAlias(node: JSDocTypedefTag | JSDocCallbackTag | JSDocEnumTag) {
             node.tagName.parent = node;
-            if (node.fullName) {
+            if (node.kind !== SyntaxKind.JSDocEnumTag && node.fullName) {
                 setParentPointers(node, node.fullName);
             }
         }
 
-        function bindCallExpressionFlow(node: CallExpression) {
-            // If the target of the call expression is a function expression or arrow function we have
-            // an immediately invoked function expression (IIFE). Initialize the flowNode property to
-            // the current control flow (which includes evaluation of the IIFE arguments).
-            let expr: Expression = node.expression;
-            while (expr.kind === SyntaxKind.ParenthesizedExpression) {
-                expr = (<ParenthesizedExpression>expr).expression;
+        function bindJSDocClassTag(node: JSDocClassTag) {
+            bindEachChild(node);
+            const host = getHostSignatureFromJSDoc(node);
+            if (host && host.kind !== SyntaxKind.MethodDeclaration) {
+                addDeclarationToSymbol(host.symbol, host, SymbolFlags.Class);
             }
-            if (expr.kind === SyntaxKind.FunctionExpression || expr.kind === SyntaxKind.ArrowFunction) {
-                bindEach(node.typeArguments);
-                bindEach(node.arguments);
-                bind(node.expression);
+        }
+
+        function bindOptionalExpression(node: Expression, trueTarget: FlowLabel, falseTarget: FlowLabel) {
+            doWithConditionalBranches(bind, node, trueTarget, falseTarget);
+            if (!isOptionalChain(node) || isOutermostOptionalChain(node)) {
+                addAntecedent(trueTarget, createFlowCondition(FlowFlags.TrueCondition, currentFlow, node));
+                addAntecedent(falseTarget, createFlowCondition(FlowFlags.FalseCondition, currentFlow, node));
+            }
+        }
+
+        function bindOptionalChainRest(node: OptionalChain) {
+            bind(node.questionDotToken);
+            switch (node.kind) {
+                case SyntaxKind.PropertyAccessExpression:
+                    bind(node.name);
+                    break;
+                case SyntaxKind.ElementAccessExpression:
+                    bind(node.argumentExpression);
+                    break;
+                case SyntaxKind.CallExpression:
+                    bindEach(node.typeArguments);
+                    bindEach(node.arguments);
+                    break;
+            }
+        }
+
+        function bindOptionalChain(node: OptionalChain, trueTarget: FlowLabel, falseTarget: FlowLabel) {
+            // For an optional chain, we emulate the behavior of a logical expression:
+            //
+            // a?.b         -> a && a.b
+            // a?.b.c       -> a && a.b.c
+            // a?.b?.c      -> a && a.b && a.b.c
+            // a?.[x = 1]   -> a && a[x = 1]
+            //
+            // To do this we descend through the chain until we reach the root of a chain (the expression with a `?.`)
+            // and build it's CFA graph as if it were the first condition (`a && ...`). Then we bind the rest
+            // of the node as part of the "true" branch, and continue to do so as we ascend back up to the outermost
+            // chain node. We then treat the entire node as the right side of the expression.
+            const preChainLabel = node.questionDotToken ? createBranchLabel() : undefined;
+            bindOptionalExpression(node.expression, preChainLabel || trueTarget, falseTarget);
+            if (preChainLabel) {
+                currentFlow = finishFlowLabel(preChainLabel);
+            }
+            doWithConditionalBranches(bindOptionalChainRest, node, trueTarget, falseTarget);
+            if (isOutermostOptionalChain(node)) {
+                addAntecedent(trueTarget, createFlowCondition(FlowFlags.TrueCondition, currentFlow, node));
+                addAntecedent(falseTarget, createFlowCondition(FlowFlags.FalseCondition, currentFlow, node));
+            }
+        }
+
+        function bindOptionalChainFlow(node: OptionalChain) {
+            if (isTopLevelLogicalExpression(node)) {
+                const postExpressionLabel = createBranchLabel();
+                bindOptionalChain(node, postExpressionLabel, postExpressionLabel);
+                currentFlow = finishFlowLabel(postExpressionLabel);
+            }
+            else {
+                bindOptionalChain(node, currentTrueTarget!, currentFalseTarget!);
+            }
+        }
+
+        function bindAccessExpressionFlow(node: AccessExpression) {
+            if (isOptionalChain(node)) {
+                bindOptionalChainFlow(node);
             }
             else {
                 bindEachChild(node);
             }
+        }
+
+        function bindCallExpressionFlow(node: CallExpression) {
+            if (isOptionalChain(node)) {
+                bindOptionalChainFlow(node);
+            }
+            else {
+                // If the target of the call expression is a function expression or arrow function we have
+                // an immediately invoked function expression (IIFE). Initialize the flowNode property to
+                // the current control flow (which includes evaluation of the IIFE arguments).
+                const expr = skipParentheses(node.expression);
+                if (expr.kind === SyntaxKind.FunctionExpression || expr.kind === SyntaxKind.ArrowFunction) {
+                    bindEach(node.typeArguments);
+                    bindEach(node.arguments);
+                    bind(node.expression);
+                }
+                else {
+                    bindEachChild(node);
+                }
+            }
             if (node.expression.kind === SyntaxKind.PropertyAccessExpression) {
                 const propertyAccess = <PropertyAccessExpression>node.expression;
                 if (isNarrowableOperand(propertyAccess.expression) && isPushOrUnshiftIdentifier(propertyAccess.name)) {
-                    currentFlow = createFlowArrayMutation(currentFlow, node);
+                    currentFlow = createFlowMutation(FlowFlags.ArrayMutation, currentFlow, node);
                 }
             }
         }
@@ -1473,7 +1636,7 @@ namespace ts {
                     if (isObjectLiteralOrClassExpressionMethod(node)) {
                         return ContainerFlags.IsContainer | ContainerFlags.IsControlFlowContainer | ContainerFlags.HasLocals | ContainerFlags.IsFunctionLike | ContainerFlags.IsObjectLiteralOrClassExpressionMethod;
                     }
-                // falls through
+                    // falls through
                 case SyntaxKind.Constructor:
                 case SyntaxKind.FunctionDeclaration:
                 case SyntaxKind.MethodSignature:
@@ -1608,15 +1771,8 @@ namespace ts {
         }
 
         function hasExportDeclarations(node: ModuleDeclaration | SourceFile): boolean {
-            const body = node.kind === SyntaxKind.SourceFile ? node : node.body;
-            if (body && (body.kind === SyntaxKind.SourceFile || body.kind === SyntaxKind.ModuleBlock)) {
-                for (const stat of (<BlockLike>body).statements) {
-                    if (stat.kind === SyntaxKind.ExportDeclaration || stat.kind === SyntaxKind.ExportAssignment) {
-                        return true;
-                    }
-                }
-            }
-            return false;
+            const body = isSourceFile(node) ? node : tryCast(node.body, isModuleBlock);
+            return !!body && body.statements.some(s => isExportDeclaration(s) || isExportAssignment(s));
         }
 
         function setExportContextFlag(node: ModuleDeclaration | SourceFile) {
@@ -1766,7 +1922,7 @@ namespace ts {
                         declareModuleMember(node, symbolFlags, symbolExcludes);
                         break;
                     }
-                // falls through
+                    // falls through
                 default:
                     if (!blockScopeContainer.locals) {
                         blockScopeContainer.locals = createSymbolTable();
@@ -1789,10 +1945,46 @@ namespace ts {
                 const host = getJSDocHost(typeAlias);
                 container = findAncestor(host.parent, n => !!(getContainerFlags(n) & ContainerFlags.IsContainer)) || file;
                 blockScopeContainer = getEnclosingBlockScopeContainer(host) || file;
-                currentFlow = { flags: FlowFlags.Start };
+                currentFlow = initFlowNode({ flags: FlowFlags.Start });
                 parent = typeAlias;
                 bind(typeAlias.typeExpression);
-                if (!typeAlias.fullName || typeAlias.fullName.kind === SyntaxKind.Identifier) {
+                const declName = getNameOfDeclaration(typeAlias);
+                if ((isJSDocEnumTag(typeAlias) || !typeAlias.fullName) && declName && isPropertyAccessEntityNameExpression(declName.parent)) {
+                    // typedef anchored to an A.B.C assignment - we need to bind into B's namespace under name C
+                    const isTopLevel = isTopLevelNamespaceAssignment(declName.parent);
+                    if (isTopLevel) {
+                        bindPotentiallyMissingNamespaces(file.symbol, declName.parent, isTopLevel,
+                            !!findAncestor(declName, d => isPropertyAccessExpression(d) && d.name.escapedText === "prototype"), /*containerIsClass*/ false);
+                        const oldContainer = container;
+                        switch (getAssignmentDeclarationPropertyAccessKind(declName.parent)) {
+                            case AssignmentDeclarationKind.ExportsProperty:
+                            case AssignmentDeclarationKind.ModuleExports:
+                                if (!isExternalOrCommonJsModule(file)) {
+                                    container = undefined!;
+                                }
+                                else {
+                                    container = file;
+                                }
+                                break;
+                            case AssignmentDeclarationKind.ThisProperty:
+                                container = declName.parent.expression;
+                                break;
+                            case AssignmentDeclarationKind.PrototypeProperty:
+                                container = (declName.parent.expression as PropertyAccessExpression).name;
+                                break;
+                            case AssignmentDeclarationKind.Property:
+                                container = isPropertyAccessExpression(declName.parent.expression) ? declName.parent.expression.name : declName.parent.expression;
+                                break;
+                            case AssignmentDeclarationKind.None:
+                                return Debug.fail("Shouldn't have detected typedef or enum on non-assignment declaration");
+                        }
+                        if (container) {
+                            declareModuleMember(typeAlias, SymbolFlags.TypeAlias, SymbolFlags.TypeAliasExcludes);
+                        }
+                        container = oldContainer;
+                    }
+                }
+                else if (isJSDocEnumTag(typeAlias) || !typeAlias.fullName || typeAlias.fullName.kind === SyntaxKind.Identifier) {
                     parent = typeAlias.parent;
                     bindBlockScopedDeclaration(typeAlias, SymbolFlags.TypeAlias, SymbolFlags.TypeAliasExcludes);
                 }
@@ -1814,7 +2006,8 @@ namespace ts {
                 node.originalKeywordKind! >= SyntaxKind.FirstFutureReservedWord &&
                 node.originalKeywordKind! <= SyntaxKind.LastFutureReservedWord &&
                 !isIdentifierName(node) &&
-                !(node.flags & NodeFlags.Ambient)) {
+                !(node.flags & NodeFlags.Ambient) &&
+                !(node.flags & NodeFlags.JSDoc)) {
 
                 // Report error only if there are no parse errors in file
                 if (!file.parseDiagnostics.length) {
@@ -2104,7 +2297,7 @@ namespace ts {
                         bindBlockScopedDeclaration(parentNode as Declaration, SymbolFlags.TypeAlias, SymbolFlags.TypeAliasExcludes);
                         break;
                     }
-                // falls through
+                    // falls through
                 case SyntaxKind.ThisKeyword:
                     if (currentFlow && (isExpression(node) || parent.kind === SyntaxKind.ShorthandPropertyAssignment)) {
                         node.flowNode = currentFlow;
@@ -2112,17 +2305,18 @@ namespace ts {
                     return checkStrictModeIdentifier(<Identifier>node);
                 case SyntaxKind.PropertyAccessExpression:
                 case SyntaxKind.ElementAccessExpression:
-                    if (currentFlow && isNarrowableReference(<Expression>node)) {
-                        node.flowNode = currentFlow;
+                    const expr = node as PropertyAccessExpression | ElementAccessExpression;
+                    if (currentFlow && isNarrowableReference(expr)) {
+                        expr.flowNode = currentFlow;
                     }
-                    if (isSpecialPropertyDeclaration(node as PropertyAccessExpression)) {
-                        bindSpecialPropertyDeclaration(node as PropertyAccessExpression);
+                    if (isSpecialPropertyDeclaration(expr)) {
+                        bindSpecialPropertyDeclaration(expr);
                     }
-                    if (isInJSFile(node) &&
+                    if (isInJSFile(expr) &&
                         file.commonJsModuleIndicator &&
-                        isModuleExportsPropertyAccessExpression(node as PropertyAccessExpression) &&
+                        isModuleExportsAccessExpression(expr) &&
                         !lookupSymbolForNameWorker(blockScopeContainer, "module" as __String)) {
-                        declareSymbol(file.locals!, /*parent*/ undefined, (node as PropertyAccessExpression).expression as Identifier,
+                        declareSymbol(file.locals!, /*parent*/ undefined, expr.expression,
                             SymbolFlags.FunctionScopedVariable | SymbolFlags.ModuleExports, SymbolFlags.FunctionScopedVariableExcludes);
                     }
                     break;
@@ -2130,22 +2324,22 @@ namespace ts {
                     const specialKind = getAssignmentDeclarationKind(node as BinaryExpression);
                     switch (specialKind) {
                         case AssignmentDeclarationKind.ExportsProperty:
-                            bindExportsPropertyAssignment(node as BinaryExpression);
+                            bindExportsPropertyAssignment(node as BindableStaticPropertyAssignmentExpression);
                             break;
                         case AssignmentDeclarationKind.ModuleExports:
-                            bindModuleExportsAssignment(node as BinaryExpression);
+                            bindModuleExportsAssignment(node as BindablePropertyAssignmentExpression);
                             break;
                         case AssignmentDeclarationKind.PrototypeProperty:
-                            bindPrototypePropertyAssignment((node as BinaryExpression).left as PropertyAccessEntityNameExpression, node);
+                            bindPrototypePropertyAssignment((node as BindableStaticPropertyAssignmentExpression).left, node);
                             break;
                         case AssignmentDeclarationKind.Prototype:
-                            bindPrototypeAssignment(node as BinaryExpression);
+                            bindPrototypeAssignment(node as BindableStaticPropertyAssignmentExpression);
                             break;
                         case AssignmentDeclarationKind.ThisProperty:
-                            bindThisPropertyAssignment(node as BinaryExpression);
+                            bindThisPropertyAssignment(node as BindablePropertyAssignmentExpression);
                             break;
                         case AssignmentDeclarationKind.Property:
-                            bindSpecialPropertyAssignment(node as BinaryExpression);
+                            bindSpecialPropertyAssignment(node as BindablePropertyAssignmentExpression);
                             break;
                         case AssignmentDeclarationKind.None:
                             // Nothing to do
@@ -2220,6 +2414,8 @@ namespace ts {
                 case SyntaxKind.JSDocTypeLiteral:
                 case SyntaxKind.MappedType:
                     return bindAnonymousTypeWorker(node as TypeLiteralNode | MappedTypeNode | JSDocTypeLiteral);
+                case SyntaxKind.JSDocClassTag:
+                    return bindJSDocClassTag(node as JSDocClassTag);
                 case SyntaxKind.ObjectLiteralExpression:
                     return bindObjectLiteralExpression(<ObjectLiteralExpression>node);
                 case SyntaxKind.FunctionExpression:
@@ -2286,7 +2482,7 @@ namespace ts {
                     if (!isFunctionLike(node.parent)) {
                         return;
                     }
-                // falls through
+                    // falls through
                 case SyntaxKind.ModuleBlock:
                     return updateStrictModeStatementList((<Block | ModuleBlock>node).statements);
 
@@ -2306,7 +2502,8 @@ namespace ts {
                     return declareSymbolAndAddToSymbolTable(propTag, flags, SymbolFlags.PropertyExcludes);
                 case SyntaxKind.JSDocTypedefTag:
                 case SyntaxKind.JSDocCallbackTag:
-                    return (delayedTypeAliases || (delayedTypeAliases = [])).push(node as JSDocTypedefTag | JSDocCallbackTag);
+                case SyntaxKind.JSDocEnumTag:
+                    return (delayedTypeAliases || (delayedTypeAliases = [])).push(node as JSDocTypedefTag | JSDocCallbackTag | JSDocEnumTag);
             }
         }
 
@@ -2419,14 +2616,13 @@ namespace ts {
             }
         }
 
-        function bindExportsPropertyAssignment(node: BinaryExpression) {
+        function bindExportsPropertyAssignment(node: BindableStaticPropertyAssignmentExpression) {
             // When we create a property via 'exports.foo = bar', the 'exports.foo' property access
             // expression is the declaration
             if (!setCommonJsModuleIndicator(node)) {
                 return;
             }
-            const lhs = node.left as PropertyAccessEntityNameExpression;
-            const symbol = forEachIdentifierInEntityName(lhs.expression, /*parent*/ undefined, (id, symbol) => {
+            const symbol = forEachIdentifierInEntityName(node.left.expression, /*parent*/ undefined, (id, symbol) => {
                 if (symbol) {
                     addDeclarationToSymbol(symbol, id, SymbolFlags.Module | SymbolFlags.Assignment);
                 }
@@ -2436,11 +2632,11 @@ namespace ts {
                 const flags = isClassExpression(node.right) ?
                     SymbolFlags.Property | SymbolFlags.ExportValue | SymbolFlags.Class :
                     SymbolFlags.Property | SymbolFlags.ExportValue;
-                declareSymbol(symbol.exports!, symbol, lhs, flags, SymbolFlags.None);
+                declareSymbol(symbol.exports!, symbol, node.left, flags, SymbolFlags.None);
             }
         }
 
-        function bindModuleExportsAssignment(node: BinaryExpression) {
+        function bindModuleExportsAssignment(node: BindablePropertyAssignmentExpression) {
             // A common practice in node modules is to set 'export = module.exports = {}', this ensures that 'exports'
             // is still pointing to 'module.exports'.
             // We do not want to consider this as 'export=' since a module can have only one of these.
@@ -2457,10 +2653,11 @@ namespace ts {
             const flags = exportAssignmentIsAlias(node)
                 ? SymbolFlags.Alias // An export= with an EntityNameExpression or a ClassExpression exports all meanings of that identifier or class
                 : SymbolFlags.Property | SymbolFlags.ExportValue | SymbolFlags.ValueModule;
-            declareSymbol(file.symbol.exports!, file.symbol, node, flags | SymbolFlags.Assignment, SymbolFlags.None);
+            const symbol = declareSymbol(file.symbol.exports!, file.symbol, node, flags | SymbolFlags.Assignment, SymbolFlags.None);
+            setValueDeclaration(symbol, node);
         }
 
-        function bindThisPropertyAssignment(node: BinaryExpression | PropertyAccessExpression) {
+        function bindThisPropertyAssignment(node: BindablePropertyAssignmentExpression | PropertyAccessExpression | LiteralLikeElementAccessExpression) {
             Debug.assert(isInJSFile(node));
             const thisContainer = getThisContainer(node, /*includeArrowFunctions*/ false);
             switch (thisContainer.kind) {
@@ -2470,16 +2667,22 @@ namespace ts {
                     // For `f.prototype.m = function() { this.x = 0; }`, `this.x = 0` should modify `f`'s members, not the function expression.
                     if (isBinaryExpression(thisContainer.parent) && thisContainer.parent.operatorToken.kind === SyntaxKind.EqualsToken) {
                         const l = thisContainer.parent.left;
-                        if (isPropertyAccessEntityNameExpression(l) && isPrototypeAccess(l.expression)) {
+                        if (isBindableStaticAccessExpression(l) && isPrototypeAccess(l.expression)) {
                             constructorSymbol = lookupSymbolForPropertyAccess(l.expression.expression, thisParentContainer);
                         }
                     }
 
-                    if (constructorSymbol) {
+                    if (constructorSymbol && constructorSymbol.valueDeclaration) {
                         // Declare a 'member' if the container is an ES5 class or ES6 constructor
                         constructorSymbol.members = constructorSymbol.members || createSymbolTable();
                         // It's acceptable for multiple 'this' assignments of the same identifier to occur
-                        declareSymbol(constructorSymbol.members, constructorSymbol, node, SymbolFlags.Property, SymbolFlags.PropertyExcludes & ~SymbolFlags.Property);
+                        if (hasDynamicName(node)) {
+                            bindDynamicallyNamedThisPropertyAssignment(node, constructorSymbol);
+                        }
+                        else {
+                            declareSymbol(constructorSymbol.members, constructorSymbol, node, SymbolFlags.Property | SymbolFlags.Assignment, SymbolFlags.PropertyExcludes & ~SymbolFlags.Property);
+                        }
+                        addDeclarationToSymbol(constructorSymbol, constructorSymbol.valueDeclaration, SymbolFlags.Class);
                     }
                     break;
 
@@ -2492,23 +2695,45 @@ namespace ts {
                     // Bind this property to the containing class
                     const containingClass = thisContainer.parent;
                     const symbolTable = hasModifier(thisContainer, ModifierFlags.Static) ? containingClass.symbol.exports! : containingClass.symbol.members!;
-                    declareSymbol(symbolTable, containingClass.symbol, node, SymbolFlags.Property, SymbolFlags.None, /*isReplaceableByMethod*/ true);
+                    if (hasDynamicName(node)) {
+                        bindDynamicallyNamedThisPropertyAssignment(node, containingClass.symbol);
+                    }
+                    else {
+                        declareSymbol(symbolTable, containingClass.symbol, node, SymbolFlags.Property | SymbolFlags.Assignment, SymbolFlags.None, /*isReplaceableByMethod*/ true);
+                    }
                     break;
                 case SyntaxKind.SourceFile:
-                    // this.foo assignment in a source file
-                    // Do not bind. It would be nice to support this someday though.
+                    // this.property = assignment in a source file -- declare symbol in exports for a module, in locals for a script
+                    if ((thisContainer as SourceFile).commonJsModuleIndicator) {
+                        declareSymbol(thisContainer.symbol.exports!, thisContainer.symbol, node, SymbolFlags.Property | SymbolFlags.ExportValue, SymbolFlags.None);
+                    }
+                    else {
+                        declareSymbolAndAddToSymbolTable(node, SymbolFlags.FunctionScopedVariable, SymbolFlags.FunctionScopedVariableExcludes);
+                    }
                     break;
 
                 default:
-                    Debug.fail(Debug.showSyntaxKind(thisContainer));
+                    Debug.failBadSyntaxKind(thisContainer);
             }
         }
 
-        function bindSpecialPropertyDeclaration(node: PropertyAccessExpression) {
+        function bindDynamicallyNamedThisPropertyAssignment(node: BinaryExpression | DynamicNamedDeclaration, symbol: Symbol) {
+            bindAnonymousDeclaration(node, SymbolFlags.Property, InternalSymbolName.Computed);
+            addLateBoundAssignmentDeclarationToSymbol(node, symbol);
+        }
+
+        function addLateBoundAssignmentDeclarationToSymbol(node: BinaryExpression | DynamicNamedDeclaration, symbol: Symbol | undefined) {
+            if (symbol) {
+                const members = symbol.assignmentDeclarationMembers || (symbol.assignmentDeclarationMembers = createMap());
+                members.set("" + getNodeId(node), node);
+            }
+        }
+
+        function bindSpecialPropertyDeclaration(node: PropertyAccessExpression | LiteralLikeElementAccessExpression) {
             if (node.expression.kind === SyntaxKind.ThisKeyword) {
                 bindThisPropertyAssignment(node);
             }
-            else if (isPropertyAccessEntityNameExpression(node) && node.parent.parent.kind === SyntaxKind.SourceFile) {
+            else if (isBindableStaticAccessExpression(node) && node.parent.parent.kind === SyntaxKind.SourceFile) {
                 if (isPrototypeAccess(node.expression)) {
                     bindPrototypePropertyAssignment(node, node.parent);
                 }
@@ -2519,15 +2744,18 @@ namespace ts {
         }
 
         /** For `x.prototype = { p, ... }`, declare members p,... if `x` is function/class/{}, or not declared. */
-        function bindPrototypeAssignment(node: BinaryExpression) {
+        function bindPrototypeAssignment(node: BindableStaticPropertyAssignmentExpression) {
             node.left.parent = node;
             node.right.parent = node;
-            const lhs = node.left as PropertyAccessEntityNameExpression;
-            bindPropertyAssignment(lhs.expression, lhs, /*isPrototypeProperty*/ false);
+            bindPropertyAssignment(node.left.expression, node.left, /*isPrototypeProperty*/ false, /*containerIsClass*/ true);
         }
 
         function bindObjectDefinePrototypeProperty(node: BindableObjectDefinePropertyCall) {
             const namespaceSymbol = lookupSymbolForPropertyAccess((node.arguments[0] as PropertyAccessExpression).expression as EntityNameExpression);
+            if (namespaceSymbol && namespaceSymbol.valueDeclaration) {
+                // Ensure the namespace symbol becomes class-like
+                addDeclarationToSymbol(namespaceSymbol, namespaceSymbol.valueDeclaration, SymbolFlags.Class);
+            }
             bindPotentiallyNewExpandoMemberToNamespace(node, namespaceSymbol, /*isPrototypeProperty*/ true);
         }
 
@@ -2535,10 +2763,10 @@ namespace ts {
          * For `x.prototype.y = z`, declare a member `y` on `x` if `x` is a function or class, or not declared.
          * Note that jsdoc preceding an ExpressionStatement like `x.prototype.y;` is also treated as a declaration.
          */
-        function bindPrototypePropertyAssignment(lhs: PropertyAccessEntityNameExpression, parent: Node) {
+        function bindPrototypePropertyAssignment(lhs: BindableStaticAccessExpression, parent: Node) {
             // Look up the function in the local scope, since prototype assignments should
             // follow the function declaration
-            const classPrototype = lhs.expression as PropertyAccessEntityNameExpression;
+            const classPrototype = lhs.expression as BindableStaticAccessExpression;
             const constructorFunction = classPrototype.expression;
 
             // Fix up parent pointers since we're going to use these nodes before we bind into them
@@ -2546,34 +2774,40 @@ namespace ts {
             constructorFunction.parent = classPrototype;
             classPrototype.parent = lhs;
 
-            bindPropertyAssignment(constructorFunction, lhs, /*isPrototypeProperty*/ true);
+            bindPropertyAssignment(constructorFunction, lhs, /*isPrototypeProperty*/ true, /*containerIsClass*/ true);
         }
 
         function bindObjectDefinePropertyAssignment(node: BindableObjectDefinePropertyCall) {
             let namespaceSymbol = lookupSymbolForPropertyAccess(node.arguments[0]);
             const isToplevel = node.parent.parent.kind === SyntaxKind.SourceFile;
-            namespaceSymbol = bindPotentiallyMissingNamespaces(namespaceSymbol, node.arguments[0], isToplevel, /*isPrototypeProperty*/ false);
+            namespaceSymbol = bindPotentiallyMissingNamespaces(namespaceSymbol, node.arguments[0], isToplevel, /*isPrototypeProperty*/ false, /*containerIsClass*/ false);
             bindPotentiallyNewExpandoMemberToNamespace(node, namespaceSymbol, /*isPrototypeProperty*/ false);
         }
 
-        function bindSpecialPropertyAssignment(node: BinaryExpression) {
-            const lhs = node.left as PropertyAccessEntityNameExpression;
+        function bindSpecialPropertyAssignment(node: BindablePropertyAssignmentExpression) {
             // Class declarations in Typescript do not allow property declarations
-            const parentSymbol = lookupSymbolForPropertyAccess(lhs.expression);
+            const parentSymbol = lookupSymbolForPropertyAccess(node.left.expression);
             if (!isInJSFile(node) && !isFunctionSymbol(parentSymbol)) {
                 return;
             }
             // Fix up parent pointers since we're going to use these nodes before we bind into them
             node.left.parent = node;
             node.right.parent = node;
-            if (isIdentifier(lhs.expression) && container === file && isNameOfExportsOrModuleExportsAliasDeclaration(file, lhs.expression)) {
+            if (isIdentifier(node.left.expression) && container === file && isExportsOrModuleExportsOrAlias(file, node.left.expression)) {
                 // This can be an alias for the 'exports' or 'module.exports' names, e.g.
                 //    var util = module.exports;
                 //    util.property = function ...
-                bindExportsPropertyAssignment(node);
+                bindExportsPropertyAssignment(node as BindableStaticPropertyAssignmentExpression);
             }
             else {
-                bindStaticPropertyAssignment(lhs);
+                if (hasDynamicName(node)) {
+                    bindAnonymousDeclaration(node, SymbolFlags.Property | SymbolFlags.Assignment, InternalSymbolName.Computed);
+                    const sym = bindPotentiallyMissingNamespaces(parentSymbol, node.left.expression, isTopLevelNamespaceAssignment(node.left), /*isPrototype*/ false, /*containerIsClass*/ false);
+                    addLateBoundAssignmentDeclarationToSymbol(node, sym);
+                }
+                else {
+                    bindStaticPropertyAssignment(cast(node.left, isBindableStaticAccessExpression));
+                }
             }
         }
 
@@ -2581,13 +2815,13 @@ namespace ts {
          * For nodes like `x.y = z`, declare a member 'y' on 'x' if x is a function (or IIFE) or class or {}, or not declared.
          * Also works for expression statements preceded by JSDoc, like / ** @type number * / x.y;
          */
-        function bindStaticPropertyAssignment(node: PropertyAccessEntityNameExpression) {
+        function bindStaticPropertyAssignment(node: BindableStaticAccessExpression) {
             node.expression.parent = node;
-            bindPropertyAssignment(node.expression, node, /*isPrototypeProperty*/ false);
+            bindPropertyAssignment(node.expression, node, /*isPrototypeProperty*/ false, /*containerIsClass*/ false);
         }
 
-        function bindPotentiallyMissingNamespaces(namespaceSymbol: Symbol | undefined, entityName: EntityNameExpression, isToplevel: boolean, isPrototypeProperty: boolean) {
-            if (isToplevel && !isPrototypeProperty && (!namespaceSymbol || !(namespaceSymbol.flags & SymbolFlags.Namespace))) {
+        function bindPotentiallyMissingNamespaces(namespaceSymbol: Symbol | undefined, entityName: BindableStaticNameExpression, isToplevel: boolean, isPrototypeProperty: boolean, containerIsClass: boolean) {
+            if (isToplevel && !isPrototypeProperty) {
                 // make symbols or add declarations for intermediate containers
                 const flags = SymbolFlags.Module | SymbolFlags.Assignment;
                 const excludeFlags = SymbolFlags.ValueModuleExcludes & ~SymbolFlags.Assignment;
@@ -2603,10 +2837,13 @@ namespace ts {
                     }
                 });
             }
+            if (containerIsClass && namespaceSymbol && namespaceSymbol.valueDeclaration) {
+                addDeclarationToSymbol(namespaceSymbol, namespaceSymbol.valueDeclaration, SymbolFlags.Class);
+            }
             return namespaceSymbol;
         }
 
-        function bindPotentiallyNewExpandoMemberToNamespace(declaration: PropertyAccessEntityNameExpression | CallExpression, namespaceSymbol: Symbol | undefined, isPrototypeProperty: boolean) {
+        function bindPotentiallyNewExpandoMemberToNamespace(declaration: BindableStaticAccessExpression | CallExpression, namespaceSymbol: Symbol | undefined, isPrototypeProperty: boolean) {
             if (!namespaceSymbol || !isExpandoSymbol(namespaceSymbol)) {
                 return;
             }
@@ -2616,18 +2853,51 @@ namespace ts {
                 (namespaceSymbol.members || (namespaceSymbol.members = createSymbolTable())) :
                 (namespaceSymbol.exports || (namespaceSymbol.exports = createSymbolTable()));
 
-            const isMethod = isFunctionLikeDeclaration(getAssignedExpandoInitializer(declaration)!);
-            const includes = isMethod ? SymbolFlags.Method : SymbolFlags.Property;
-            const excludes = isMethod ? SymbolFlags.MethodExcludes : SymbolFlags.PropertyExcludes;
+            let includes = SymbolFlags.None;
+            let excludes = SymbolFlags.None;
+            // Method-like
+            if (isFunctionLikeDeclaration(getAssignedExpandoInitializer(declaration)!)) {
+                includes = SymbolFlags.Method;
+                excludes = SymbolFlags.MethodExcludes;
+            }
+            // Maybe accessor-like
+            else if (isCallExpression(declaration) && isBindableObjectDefinePropertyCall(declaration)) {
+                if (some(declaration.arguments[2].properties, p => {
+                    const id = getNameOfDeclaration(p);
+                    return !!id && isIdentifier(id) && idText(id) === "set";
+                })) {
+                    // We mix in `SymbolFLags.Property` so in the checker `getTypeOfVariableParameterOrProperty` is used for this
+                    // symbol, instead of `getTypeOfAccessor` (which will assert as there is no real accessor declaration)
+                    includes |= SymbolFlags.SetAccessor | SymbolFlags.Property;
+                    excludes |= SymbolFlags.SetAccessorExcludes;
+                }
+                if (some(declaration.arguments[2].properties, p => {
+                    const id = getNameOfDeclaration(p);
+                    return !!id && isIdentifier(id) && idText(id) === "get";
+                })) {
+                    includes |= SymbolFlags.GetAccessor | SymbolFlags.Property;
+                    excludes |= SymbolFlags.GetAccessorExcludes;
+                }
+            }
+
+            if (includes === SymbolFlags.None) {
+                includes = SymbolFlags.Property;
+                excludes = SymbolFlags.PropertyExcludes;
+            }
+
             declareSymbol(symbolTable, namespaceSymbol, declaration, includes | SymbolFlags.Assignment, excludes & ~SymbolFlags.Assignment);
         }
 
-        function bindPropertyAssignment(name: EntityNameExpression, propertyAccess: PropertyAccessEntityNameExpression, isPrototypeProperty: boolean) {
-            let namespaceSymbol = lookupSymbolForPropertyAccess(name);
-            const isToplevel = isBinaryExpression(propertyAccess.parent)
+        function isTopLevelNamespaceAssignment(propertyAccess: BindableAccessExpression) {
+            return isBinaryExpression(propertyAccess.parent)
                 ? getParentOfBinaryExpression(propertyAccess.parent).parent.kind === SyntaxKind.SourceFile
                 : propertyAccess.parent.parent.kind === SyntaxKind.SourceFile;
-            namespaceSymbol = bindPotentiallyMissingNamespaces(namespaceSymbol, propertyAccess.expression, isToplevel, isPrototypeProperty);
+        }
+
+        function bindPropertyAssignment(name: BindableStaticNameExpression, propertyAccess: BindableStaticAccessExpression, isPrototypeProperty: boolean, containerIsClass: boolean) {
+            let namespaceSymbol = lookupSymbolForPropertyAccess(name);
+            const isToplevel = isTopLevelNamespaceAssignment(propertyAccess);
+            namespaceSymbol = bindPotentiallyMissingNamespaces(namespaceSymbol, propertyAccess.expression, isToplevel, isPrototypeProperty, containerIsClass);
             bindPotentiallyNewExpandoMemberToNamespace(propertyAccess, namespaceSymbol, isPrototypeProperty);
         }
 
@@ -2657,7 +2927,7 @@ namespace ts {
             init = init && getRightMostAssignedExpression(init);
             if (init) {
                 const isPrototypeAssignment = isPrototypeAccess(isVariableDeclaration(node) ? node.name : isBinaryExpression(node) ? node.left : node);
-                return !!getExpandoInitializer(isBinaryExpression(init) && init.operatorToken.kind === SyntaxKind.BarBarToken ? init.right : init, isPrototypeAssignment);
+                return !!getExpandoInitializer(isBinaryExpression(init) && (init.operatorToken.kind === SyntaxKind.BarBarToken || init.operatorToken.kind === SyntaxKind.QuestionQuestionToken) ? init.right : init, isPrototypeAssignment);
             }
             return false;
         }
@@ -2669,17 +2939,17 @@ namespace ts {
             return expr.parent;
         }
 
-        function lookupSymbolForPropertyAccess(node: EntityNameExpression, lookupContainer: Node = container): Symbol | undefined {
+        function lookupSymbolForPropertyAccess(node: BindableStaticNameExpression, lookupContainer: Node = container): Symbol | undefined {
             if (isIdentifier(node)) {
                 return lookupSymbolForNameWorker(lookupContainer, node.escapedText);
             }
             else {
                 const symbol = lookupSymbolForPropertyAccess(node.expression);
-                return symbol && symbol.exports && symbol.exports.get(node.name.escapedText);
+                return symbol && symbol.exports && symbol.exports.get(getElementOrPropertyAccessName(node));
             }
         }
 
-        function forEachIdentifierInEntityName(e: EntityNameExpression, parent: Symbol | undefined, action: (e: Identifier, symbol: Symbol | undefined, parent: Symbol | undefined) => Symbol | undefined): Symbol | undefined {
+        function forEachIdentifierInEntityName(e: BindableStaticNameExpression, parent: Symbol | undefined, action: (e: Declaration, symbol: Symbol | undefined, parent: Symbol | undefined) => Symbol | undefined): Symbol | undefined {
             if (isExportsOrModuleExportsOrAlias(file, e)) {
                 return file.symbol;
             }
@@ -2688,8 +2958,7 @@ namespace ts {
             }
             else {
                 const s = forEachIdentifierInEntityName(e.expression, parent, action);
-                if (!s || !s.exports) return Debug.fail();
-                return action(e.name, s.exports.get(e.name.escapedText), s);
+                return action(getNameOrArgument(e), s && s.exports && s.exports.get(getElementOrPropertyAccessName(e)), s);
             }
         }
 
@@ -2749,11 +3018,8 @@ namespace ts {
             }
 
             if (!isBindingPattern(node.name)) {
-                const isEnum = isInJSFile(node) && !!getJSDocEnumTag(node);
-                const enumFlags = (isEnum ? SymbolFlags.RegularEnum : SymbolFlags.None);
-                const enumExcludes = (isEnum ? SymbolFlags.RegularEnumExcludes : SymbolFlags.None);
                 if (isBlockOrCatchScoped(node)) {
-                    bindBlockScopedDeclaration(node, SymbolFlags.BlockScopedVariable | enumFlags, SymbolFlags.BlockScopedVariableExcludes | enumExcludes);
+                    bindBlockScopedDeclaration(node, SymbolFlags.BlockScopedVariable, SymbolFlags.BlockScopedVariableExcludes);
                 }
                 else if (isParameterDeclaration(node)) {
                     // It is safe to walk up parent chain to find whether the node is a destructuring parameter declaration
@@ -2768,7 +3034,7 @@ namespace ts {
                     declareSymbolAndAddToSymbolTable(node, SymbolFlags.FunctionScopedVariable, SymbolFlags.ParameterExcludes);
                 }
                 else {
-                    declareSymbolAndAddToSymbolTable(node, SymbolFlags.FunctionScopedVariable | enumFlags, SymbolFlags.FunctionScopedVariableExcludes | enumExcludes);
+                    declareSymbolAndAddToSymbolTable(node, SymbolFlags.FunctionScopedVariable, SymbolFlags.FunctionScopedVariableExcludes);
                 }
             }
         }
@@ -2792,7 +3058,7 @@ namespace ts {
 
             // If this is a property-parameter, then also declare the property symbol into the
             // containing class.
-            if (isParameterPropertyDeclaration(node)) {
+            if (isParameterPropertyDeclaration(node, node.parent)) {
                 const classDeclaration = <ClassLikeDeclaration>node.parent.parent;
                 declareSymbol(classDeclaration.symbol.members!, classDeclaration.symbol, node, SymbolFlags.Property | (node.questionToken ? SymbolFlags.Optional : SymbolFlags.None), SymbolFlags.PropertyExcludes);
             }
@@ -2961,21 +3227,27 @@ namespace ts {
     }
 
     export function isExportsOrModuleExportsOrAlias(sourceFile: SourceFile, node: Expression): boolean {
-        return isExportsIdentifier(node) ||
-            isModuleExportsPropertyAccessExpression(node) ||
-            isIdentifier(node) && isNameOfExportsOrModuleExportsAliasDeclaration(sourceFile, node);
-    }
-
-    function isNameOfExportsOrModuleExportsAliasDeclaration(sourceFile: SourceFile, node: Identifier): boolean {
-        const symbol = lookupSymbolForNameWorker(sourceFile, node.escapedText);
-        return !!symbol && !!symbol.valueDeclaration && isVariableDeclaration(symbol.valueDeclaration) &&
-            !!symbol.valueDeclaration.initializer && isExportsOrModuleExportsOrAliasOrAssignment(sourceFile, symbol.valueDeclaration.initializer);
-    }
-
-    function isExportsOrModuleExportsOrAliasOrAssignment(sourceFile: SourceFile, node: Expression): boolean {
-        return isExportsOrModuleExportsOrAlias(sourceFile, node) ||
-            (isAssignmentExpression(node, /*excludeCompoundAssignment*/ true) && (
-                isExportsOrModuleExportsOrAliasOrAssignment(sourceFile, node.left) || isExportsOrModuleExportsOrAliasOrAssignment(sourceFile, node.right)));
+        let i = 0;
+        const q = [node];
+        while (q.length && i < 100) {
+            i++;
+            node = q.shift()!;
+            if (isExportsIdentifier(node) || isModuleExportsAccessExpression(node)) {
+                return true;
+            }
+            else if (isIdentifier(node)) {
+                const symbol = lookupSymbolForNameWorker(sourceFile, node.escapedText);
+                if (!!symbol && !!symbol.valueDeclaration && isVariableDeclaration(symbol.valueDeclaration) && !!symbol.valueDeclaration.initializer) {
+                    const init = symbol.valueDeclaration.initializer;
+                    q.push(init);
+                    if (isAssignmentExpression(init, /*excludeCompoundAssignment*/ true)) {
+                        q.push(init.left);
+                        q.push(init.right);
+                    }
+                }
+            }
+        }
+        return false;
     }
 
     function lookupSymbolForNameWorker(container: Node, name: __String): Symbol | undefined {
@@ -3084,32 +3356,28 @@ namespace ts {
 
     function computeCallExpression(node: CallExpression, subtreeFlags: TransformFlags) {
         let transformFlags = subtreeFlags;
+        const callee = skipOuterExpressions(node.expression);
         const expression = node.expression;
+
+        if (node.flags & NodeFlags.OptionalChain) {
+            transformFlags |= TransformFlags.ContainsESNext;
+        }
 
         if (node.typeArguments) {
             transformFlags |= TransformFlags.AssertTypeScript;
         }
 
-        if (subtreeFlags & TransformFlags.ContainsRestOrSpread
-            || (expression.transformFlags & (TransformFlags.Super | TransformFlags.ContainsSuper))) {
+        if (subtreeFlags & TransformFlags.ContainsRestOrSpread || isSuperOrSuperProperty(callee)) {
             // If the this node contains a SpreadExpression, or is a super call, then it is an ES6
             // node.
             transformFlags |= TransformFlags.AssertES2015;
-            // super property or element accesses could be inside lambdas, etc, and need a captured `this`,
-            // while super keyword for super calls (indicated by TransformFlags.Super) does not (since it can only be top-level in a constructor)
-            if (expression.transformFlags & TransformFlags.ContainsSuper) {
+            if (isSuperProperty(callee)) {
                 transformFlags |= TransformFlags.ContainsLexicalThis;
             }
         }
 
         if (expression.kind === SyntaxKind.ImportKeyword) {
             transformFlags |= TransformFlags.ContainsDynamicImport;
-
-            // A dynamic 'import()' call that contains a lexical 'this' will
-            // require a captured 'this' when emitting down-level.
-            if (subtreeFlags & TransformFlags.ContainsLexicalThis) {
-                transformFlags |= TransformFlags.ContainsCapturedLexicalThis;
-            }
         }
 
         node.transformFlags = transformFlags | TransformFlags.HasComputedFlags;
@@ -3135,10 +3403,13 @@ namespace ts {
         const operatorTokenKind = node.operatorToken.kind;
         const leftKind = node.left.kind;
 
-        if (operatorTokenKind === SyntaxKind.EqualsToken && leftKind === SyntaxKind.ObjectLiteralExpression) {
+        if (operatorTokenKind === SyntaxKind.QuestionQuestionToken) {
+            transformFlags |= TransformFlags.AssertESNext;
+        }
+        else if (operatorTokenKind === SyntaxKind.EqualsToken && leftKind === SyntaxKind.ObjectLiteralExpression) {
             // Destructuring object assignments with are ES2015 syntax
-            // and possibly ESNext if they contain rest
-            transformFlags |= TransformFlags.AssertESNext | TransformFlags.AssertES2015 | TransformFlags.AssertDestructuringAssignment;
+            // and possibly ES2018 if they contain rest
+            transformFlags |= TransformFlags.AssertES2018 | TransformFlags.AssertES2015 | TransformFlags.AssertDestructuringAssignment;
         }
         else if (operatorTokenKind === SyntaxKind.EqualsToken && leftKind === SyntaxKind.ArrayLiteralExpression) {
             // Destructuring assignments are ES2015 syntax.
@@ -3174,15 +3445,15 @@ namespace ts {
             transformFlags |= TransformFlags.AssertTypeScript | TransformFlags.ContainsTypeScriptClassSyntax;
         }
 
-        // parameters with object rest destructuring are ES Next syntax
+        // parameters with object rest destructuring are ES2018 syntax
         if (subtreeFlags & TransformFlags.ContainsObjectRestOrSpread) {
-            transformFlags |= TransformFlags.AssertESNext;
+            transformFlags |= TransformFlags.AssertES2018;
         }
 
         // If a parameter has an initializer, a binding pattern or a dotDotDot token, then
         // it is ES6 syntax and its container must emit default value assignments or parameter destructuring downlevel.
         if (subtreeFlags & TransformFlags.ContainsBindingPattern || initializer || dotDotDotToken) {
-            transformFlags |= TransformFlags.AssertES2015 | TransformFlags.ContainsDefaultValueAssignments;
+            transformFlags |= TransformFlags.AssertES2015;
         }
 
         node.transformFlags = transformFlags | TransformFlags.HasComputedFlags;
@@ -3193,7 +3464,6 @@ namespace ts {
         let transformFlags = subtreeFlags;
         const expression = node.expression;
         const expressionKind = expression.kind;
-        const expressionTransformFlags = expression.transformFlags;
 
         // If the node is synthesized, it means the emitter put the parentheses there,
         // not the user. If we didn't want them, the emitter would not have put them
@@ -3201,12 +3471,6 @@ namespace ts {
         if (expressionKind === SyntaxKind.AsExpression
             || expressionKind === SyntaxKind.TypeAssertionExpression) {
             transformFlags |= TransformFlags.AssertTypeScript;
-        }
-
-        // If the expression of a ParenthesizedExpression is a destructuring assignment,
-        // then the ParenthesizedExpression is a destructuring assignment.
-        if (expressionTransformFlags & TransformFlags.DestructuringAssignment) {
-            transformFlags |= TransformFlags.DestructuringAssignment;
         }
 
         node.transformFlags = transformFlags | TransformFlags.HasComputedFlags;
@@ -3224,19 +3488,12 @@ namespace ts {
             // A ClassDeclaration is ES6 syntax.
             transformFlags = subtreeFlags | TransformFlags.AssertES2015;
 
-            // A class with a parameter property assignment, property initializer, computed property name, or decorator is
-            // TypeScript syntax.
+            // A class with a parameter property assignment or decorator is TypeScript syntax.
             // An exported declaration may be TypeScript syntax, but is handled by the visitor
             // for a namespace declaration.
             if ((subtreeFlags & TransformFlags.ContainsTypeScriptClassSyntax)
                 || node.typeParameters) {
                 transformFlags |= TransformFlags.AssertTypeScript;
-            }
-
-            if (subtreeFlags & TransformFlags.ContainsLexicalThisInComputedPropertyName) {
-                // A computed property name containing `this` might need to be rewritten,
-                // so propagate the ContainsLexicalThis flag upward.
-                transformFlags |= TransformFlags.ContainsLexicalThis;
             }
         }
 
@@ -3248,17 +3505,10 @@ namespace ts {
         // A ClassExpression is ES6 syntax.
         let transformFlags = subtreeFlags | TransformFlags.AssertES2015;
 
-        // A class with a parameter property assignment, property initializer, or decorator is
-        // TypeScript syntax.
+        // A class with a parameter property assignment or decorator is TypeScript syntax.
         if (subtreeFlags & TransformFlags.ContainsTypeScriptClassSyntax
             || node.typeParameters) {
             transformFlags |= TransformFlags.AssertTypeScript;
-        }
-
-        if (subtreeFlags & TransformFlags.ContainsLexicalThisInComputedPropertyName) {
-            // A computed property name containing `this` might need to be rewritten,
-            // so propagate the ContainsLexicalThis flag upward.
-            transformFlags |= TransformFlags.ContainsLexicalThis;
         }
 
         node.transformFlags = transformFlags | TransformFlags.HasComputedFlags;
@@ -3292,7 +3542,7 @@ namespace ts {
         let transformFlags = subtreeFlags;
 
         if (!node.variableDeclaration) {
-            transformFlags |= TransformFlags.AssertESNext;
+            transformFlags |= TransformFlags.AssertES2019;
         }
         else if (isBindingPattern(node.variableDeclaration.name)) {
             transformFlags |= TransformFlags.AssertES2015;
@@ -3326,9 +3576,9 @@ namespace ts {
             transformFlags |= TransformFlags.AssertTypeScript;
         }
 
-        // function declarations with object rest destructuring are ES Next syntax
+        // function declarations with object rest destructuring are ES2018 syntax
         if (subtreeFlags & TransformFlags.ContainsObjectRestOrSpread) {
-            transformFlags |= TransformFlags.AssertESNext;
+            transformFlags |= TransformFlags.AssertES2018;
         }
 
         node.transformFlags = transformFlags | TransformFlags.HasComputedFlags;
@@ -3345,19 +3595,19 @@ namespace ts {
             || hasModifier(node, ModifierFlags.TypeScriptModifier)
             || node.typeParameters
             || node.type
-            || (node.name && isComputedPropertyName(node.name)) // While computed method names aren't typescript, the TS transform must visit them to emit property declarations correctly
-            || !node.body) {
+            || !node.body
+            || node.questionToken) {
             transformFlags |= TransformFlags.AssertTypeScript;
         }
 
-        // function declarations with object rest destructuring are ES Next syntax
+        // function declarations with object rest destructuring are ES2018 syntax
         if (subtreeFlags & TransformFlags.ContainsObjectRestOrSpread) {
-            transformFlags |= TransformFlags.AssertESNext;
+            transformFlags |= TransformFlags.AssertES2018;
         }
 
         // An async method declaration is ES2017 syntax.
         if (hasModifier(node, ModifierFlags.Async)) {
-            transformFlags |= node.asteriskToken ? TransformFlags.AssertESNext : TransformFlags.AssertES2017;
+            transformFlags |= node.asteriskToken ? TransformFlags.AssertES2018 : TransformFlags.AssertES2017;
         }
 
         if (node.asteriskToken) {
@@ -3365,7 +3615,7 @@ namespace ts {
         }
 
         node.transformFlags = transformFlags | TransformFlags.HasComputedFlags;
-        return transformFlags & ~TransformFlags.MethodOrAccessorExcludes;
+        return propagatePropertyNameFlags(node.name, transformFlags & ~TransformFlags.MethodOrAccessorExcludes);
     }
 
     function computeAccessor(node: AccessorDeclaration, subtreeFlags: TransformFlags) {
@@ -3376,32 +3626,34 @@ namespace ts {
         if (node.decorators
             || hasModifier(node, ModifierFlags.TypeScriptModifier)
             || node.type
-            || (node.name && isComputedPropertyName(node.name)) // While computed accessor names aren't typescript, the TS transform must visit them to emit property declarations correctly
             || !node.body) {
             transformFlags |= TransformFlags.AssertTypeScript;
         }
 
-        // function declarations with object rest destructuring are ES Next syntax
+        // function declarations with object rest destructuring are ES2018 syntax
         if (subtreeFlags & TransformFlags.ContainsObjectRestOrSpread) {
-            transformFlags |= TransformFlags.AssertESNext;
+            transformFlags |= TransformFlags.AssertES2018;
         }
 
         node.transformFlags = transformFlags | TransformFlags.HasComputedFlags;
-        return transformFlags & ~TransformFlags.MethodOrAccessorExcludes;
+        return propagatePropertyNameFlags(node.name, transformFlags & ~TransformFlags.MethodOrAccessorExcludes);
     }
 
     function computePropertyDeclaration(node: PropertyDeclaration, subtreeFlags: TransformFlags) {
-        // A PropertyDeclaration is TypeScript syntax.
-        let transformFlags = subtreeFlags | TransformFlags.AssertTypeScript;
+        let transformFlags = subtreeFlags | TransformFlags.ContainsClassFields;
 
-        // If the PropertyDeclaration has an initializer or a computed name, we need to inform its ancestor
-        // so that it handle the transformation.
-        if (node.initializer || isComputedPropertyName(node.name)) {
+        // Decorators, TypeScript-specific modifiers, and type annotations are TypeScript syntax.
+        if (some(node.decorators) || hasModifier(node, ModifierFlags.TypeScriptModifier) || node.type || node.questionToken || node.exclamationToken) {
+            transformFlags |= TransformFlags.AssertTypeScript;
+        }
+
+        // Hoisted variables related to class properties should live within the TypeScript class wrapper.
+        if (isComputedPropertyName(node.name) || (hasStaticModifier(node) && node.initializer)) {
             transformFlags |= TransformFlags.ContainsTypeScriptClassSyntax;
         }
 
         node.transformFlags = transformFlags | TransformFlags.HasComputedFlags;
-        return transformFlags & ~TransformFlags.NodeExcludes;
+        return propagatePropertyNameFlags(node.name, transformFlags & ~TransformFlags.PropertyExcludes);
     }
 
     function computeFunctionDeclaration(node: FunctionDeclaration, subtreeFlags: TransformFlags) {
@@ -3427,19 +3679,12 @@ namespace ts {
 
             // An async function declaration is ES2017 syntax.
             if (modifierFlags & ModifierFlags.Async) {
-                transformFlags |= node.asteriskToken ? TransformFlags.AssertESNext : TransformFlags.AssertES2017;
+                transformFlags |= node.asteriskToken ? TransformFlags.AssertES2018 : TransformFlags.AssertES2017;
             }
 
-            // function declarations with object rest destructuring are ES Next syntax
+            // function declarations with object rest destructuring are ES2018 syntax
             if (subtreeFlags & TransformFlags.ContainsObjectRestOrSpread) {
-                transformFlags |= TransformFlags.AssertESNext;
-            }
-
-            // If a FunctionDeclaration's subtree has marked the container as needing to capture the
-            // lexical this, or the function contains parameters with initializers, then this node is
-            // ES6 syntax.
-            if (subtreeFlags & TransformFlags.ES2015FunctionSyntaxMask) {
-                transformFlags |= TransformFlags.AssertES2015;
+                transformFlags |= TransformFlags.AssertES2018;
             }
 
             // If a FunctionDeclaration is generator function and is the body of a
@@ -3469,20 +3714,12 @@ namespace ts {
 
         // An async function expression is ES2017 syntax.
         if (hasModifier(node, ModifierFlags.Async)) {
-            transformFlags |= node.asteriskToken ? TransformFlags.AssertESNext : TransformFlags.AssertES2017;
+            transformFlags |= node.asteriskToken ? TransformFlags.AssertES2018 : TransformFlags.AssertES2017;
         }
 
-        // function expressions with object rest destructuring are ES Next syntax
+        // function expressions with object rest destructuring are ES2018 syntax
         if (subtreeFlags & TransformFlags.ContainsObjectRestOrSpread) {
-            transformFlags |= TransformFlags.AssertESNext;
-        }
-
-
-        // If a FunctionExpression's subtree has marked the container as needing to capture the
-        // lexical this, or the function contains parameters with initializers, then this node is
-        // ES6 syntax.
-        if (subtreeFlags & TransformFlags.ES2015FunctionSyntaxMask) {
-            transformFlags |= TransformFlags.AssertES2015;
+            transformFlags |= TransformFlags.AssertES2018;
         }
 
         // If a FunctionExpression is generator function and is the body of a
@@ -3513,14 +3750,9 @@ namespace ts {
             transformFlags |= TransformFlags.AssertES2017;
         }
 
-        // arrow functions with object rest destructuring are ES Next syntax
+        // arrow functions with object rest destructuring are ES2018 syntax
         if (subtreeFlags & TransformFlags.ContainsObjectRestOrSpread) {
-            transformFlags |= TransformFlags.AssertESNext;
-        }
-
-        // If an ArrowFunction contains a lexical this, its container must capture the lexical this.
-        if (subtreeFlags & TransformFlags.ContainsLexicalThis) {
-            transformFlags |= TransformFlags.ContainsCapturedLexicalThis;
+            transformFlags |= TransformFlags.AssertES2018;
         }
 
         node.transformFlags = transformFlags | TransformFlags.HasComputedFlags;
@@ -3530,13 +3762,16 @@ namespace ts {
     function computePropertyAccess(node: PropertyAccessExpression, subtreeFlags: TransformFlags) {
         let transformFlags = subtreeFlags;
 
+        if (node.flags & NodeFlags.OptionalChain) {
+            transformFlags |= TransformFlags.ContainsESNext;
+        }
+
         // If a PropertyAccessExpression starts with a super keyword, then it is
         // ES6 syntax, and requires a lexical `this` binding.
-        if (transformFlags & TransformFlags.Super) {
-            transformFlags ^= TransformFlags.Super;
+        if (node.expression.kind === SyntaxKind.SuperKeyword) {
             // super inside of an async function requires hoisting the super access (ES2017).
-            // same for super inside of an async generator, which is ESNext.
-            transformFlags |= TransformFlags.ContainsSuper | TransformFlags.ContainsES2017 | TransformFlags.ContainsESNext;
+            // same for super inside of an async generator, which is ES2018.
+            transformFlags |= TransformFlags.ContainsES2017 | TransformFlags.ContainsES2018;
         }
 
         node.transformFlags = transformFlags | TransformFlags.HasComputedFlags;
@@ -3545,16 +3780,17 @@ namespace ts {
 
     function computeElementAccess(node: ElementAccessExpression, subtreeFlags: TransformFlags) {
         let transformFlags = subtreeFlags;
-        const expression = node.expression;
-        const expressionFlags = expression.transformFlags; // We do not want to aggregate flags from the argument expression for super/this capturing
+
+        if (node.flags & NodeFlags.OptionalChain) {
+            transformFlags |= TransformFlags.ContainsESNext;
+        }
 
         // If an ElementAccessExpression starts with a super keyword, then it is
         // ES6 syntax, and requires a lexical `this` binding.
-        if (expressionFlags & TransformFlags.Super) {
-            transformFlags &= ~TransformFlags.Super;
+        if (node.expression.kind === SyntaxKind.SuperKeyword) {
             // super inside of an async function requires hoisting the super access (ES2017).
-            // same for super inside of an async generator, which is ESNext.
-            transformFlags |= TransformFlags.ContainsSuper | TransformFlags.ContainsES2017 | TransformFlags.ContainsESNext;
+            // same for super inside of an async generator, which is ES2018.
+            transformFlags |= TransformFlags.ContainsES2017 | TransformFlags.ContainsES2018;
         }
 
         node.transformFlags = transformFlags | TransformFlags.HasComputedFlags;
@@ -3563,15 +3799,15 @@ namespace ts {
 
     function computeVariableDeclaration(node: VariableDeclaration, subtreeFlags: TransformFlags) {
         let transformFlags = subtreeFlags;
-        transformFlags |= TransformFlags.AssertES2015 | TransformFlags.ContainsBindingPattern;
+        transformFlags |= TransformFlags.AssertES2015 | TransformFlags.ContainsBindingPattern; // TODO(rbuckton): Why are these set unconditionally?
 
-        // A VariableDeclaration containing ObjectRest is ESNext syntax
+        // A VariableDeclaration containing ObjectRest is ES2018 syntax
         if (subtreeFlags & TransformFlags.ContainsObjectRestOrSpread) {
-            transformFlags |= TransformFlags.AssertESNext;
+            transformFlags |= TransformFlags.AssertES2018;
         }
 
         // Type annotations are TypeScript syntax.
-        if (node.type) {
+        if (node.type || node.exclamationToken) {
             transformFlags |= TransformFlags.AssertTypeScript;
         }
 
@@ -3625,15 +3861,7 @@ namespace ts {
     }
 
     function computeExpressionStatement(node: ExpressionStatement, subtreeFlags: TransformFlags) {
-        let transformFlags = subtreeFlags;
-
-        // If the expression of an expression statement is a destructuring assignment,
-        // then we treat the statement as ES6 so that we can indicate that we do not
-        // need to hold on to the right-hand side.
-        if (node.expression.transformFlags & TransformFlags.DestructuringAssignment) {
-            transformFlags |= TransformFlags.AssertES2015;
-        }
-
+        const transformFlags = subtreeFlags;
         node.transformFlags = transformFlags | TransformFlags.HasComputedFlags;
         return transformFlags & ~TransformFlags.NodeExcludes;
     }
@@ -3674,8 +3902,8 @@ namespace ts {
         switch (kind) {
             case SyntaxKind.AsyncKeyword:
             case SyntaxKind.AwaitExpression:
-                // async/await is ES2017 syntax, but may be ESNext syntax (for async generators)
-                transformFlags |= TransformFlags.AssertESNext | TransformFlags.AssertES2017;
+                // async/await is ES2017 syntax, but may be ES2018 syntax (for async generators)
+                transformFlags |= TransformFlags.AssertES2018 | TransformFlags.AssertES2017;
                 break;
 
             case SyntaxKind.TypeAssertionExpression:
@@ -3747,7 +3975,7 @@ namespace ts {
             case SyntaxKind.ForOfStatement:
                 // This node is either ES2015 syntax or ES2017 syntax (if it is a for-await-of).
                 if ((<ForOfStatement>node).awaitModifier) {
-                    transformFlags |= TransformFlags.AssertESNext;
+                    transformFlags |= TransformFlags.AssertES2018;
                 }
                 transformFlags |= TransformFlags.AssertES2015;
                 break;
@@ -3755,7 +3983,7 @@ namespace ts {
             case SyntaxKind.YieldExpression:
                 // This node is either ES2015 syntax (in a generator) or ES2017 syntax (in an async
                 // generator).
-                transformFlags |= TransformFlags.AssertESNext | TransformFlags.AssertES2015 | TransformFlags.ContainsYield;
+                transformFlags |= TransformFlags.AssertES2018 | TransformFlags.AssertES2015 | TransformFlags.ContainsYield;
                 break;
 
             case SyntaxKind.AnyKeyword:
@@ -3806,17 +4034,6 @@ namespace ts {
                 // This is so that they can flow through PropertyName transforms unaffected.
                 // Instead, we mark the container as ES6, so that it can properly handle the transform.
                 transformFlags |= TransformFlags.ContainsComputedPropertyName;
-                if (subtreeFlags & TransformFlags.ContainsLexicalThis) {
-                    // A computed method name like `[this.getName()](x: string) { ... }` needs to
-                    // distinguish itself from the normal case of a method body containing `this`:
-                    // `this` inside a method doesn't need to be rewritten (the method provides `this`),
-                    // whereas `this` inside a computed name *might* need to be rewritten if the class/object
-                    // is inside an arrow function:
-                    // `_this = this; () => class K { [_this.getName()]() { ... } }`
-                    // To make this distinction, use ContainsLexicalThisInComputedPropertyName
-                    // instead of ContainsLexicalThis for computed property names
-                    transformFlags |= TransformFlags.ContainsLexicalThisInComputedPropertyName;
-                }
                 break;
 
             case SyntaxKind.SpreadElement:
@@ -3824,12 +4041,12 @@ namespace ts {
                 break;
 
             case SyntaxKind.SpreadAssignment:
-                transformFlags |= TransformFlags.AssertESNext | TransformFlags.ContainsObjectRestOrSpread;
+                transformFlags |= TransformFlags.AssertES2018 | TransformFlags.ContainsObjectRestOrSpread;
                 break;
 
             case SyntaxKind.SuperKeyword:
                 // This node is ES6 syntax.
-                transformFlags |= TransformFlags.AssertES2015 | TransformFlags.Super;
+                transformFlags |= TransformFlags.AssertES2015;
                 excludeFlags = TransformFlags.OuterExpressionExcludes; // must be set to persist `Super`
                 break;
 
@@ -3841,7 +4058,7 @@ namespace ts {
             case SyntaxKind.ObjectBindingPattern:
                 transformFlags |= TransformFlags.AssertES2015 | TransformFlags.ContainsBindingPattern;
                 if (subtreeFlags & TransformFlags.ContainsRestOrSpread) {
-                    transformFlags |= TransformFlags.AssertESNext | TransformFlags.ContainsObjectRestOrSpread;
+                    transformFlags |= TransformFlags.AssertES2018 | TransformFlags.ContainsObjectRestOrSpread;
                 }
                 excludeFlags = TransformFlags.BindingPatternExcludes;
                 break;
@@ -3871,29 +4088,16 @@ namespace ts {
                     transformFlags |= TransformFlags.AssertES2015;
                 }
 
-                if (subtreeFlags & TransformFlags.ContainsLexicalThisInComputedPropertyName) {
-                    // A computed property name containing `this` might need to be rewritten,
-                    // so propagate the ContainsLexicalThis flag upward.
-                    transformFlags |= TransformFlags.ContainsLexicalThis;
-                }
-
                 if (subtreeFlags & TransformFlags.ContainsObjectRestOrSpread) {
                     // If an ObjectLiteralExpression contains a spread element, then it
-                    // is an ES next node.
-                    transformFlags |= TransformFlags.AssertESNext;
+                    // is an ES2018 node.
+                    transformFlags |= TransformFlags.AssertES2018;
                 }
 
                 break;
 
             case SyntaxKind.ArrayLiteralExpression:
-            case SyntaxKind.NewExpression:
                 excludeFlags = TransformFlags.ArrayLiteralOrCallOrNewExcludes;
-                if (subtreeFlags & TransformFlags.ContainsRestOrSpread) {
-                    // If the this node contains a SpreadExpression, then it is an ES6
-                    // node.
-                    transformFlags |= TransformFlags.AssertES2015;
-                }
-
                 break;
 
             case SyntaxKind.DoStatement:
@@ -3908,15 +4112,11 @@ namespace ts {
                 break;
 
             case SyntaxKind.SourceFile:
-                if (subtreeFlags & TransformFlags.ContainsCapturedLexicalThis) {
-                    transformFlags |= TransformFlags.AssertES2015;
-                }
-
                 break;
 
             case SyntaxKind.ReturnStatement:
-                // Return statements may require an `await` in ESNext.
-                transformFlags |= TransformFlags.ContainsHoistedDeclarationOrCompletion | TransformFlags.AssertESNext;
+                // Return statements may require an `await` in ES2018.
+                transformFlags |= TransformFlags.ContainsHoistedDeclarationOrCompletion | TransformFlags.AssertES2018;
                 break;
 
             case SyntaxKind.ContinueStatement:
@@ -3927,6 +4127,10 @@ namespace ts {
 
         node.transformFlags = transformFlags | TransformFlags.HasComputedFlags;
         return transformFlags & ~excludeFlags;
+    }
+
+    function propagatePropertyNameFlags(node: PropertyName, transformFlags: TransformFlags) {
+        return transformFlags | (node.transformFlags & TransformFlags.PropertyNamePropagatingFlags);
     }
 
     /**

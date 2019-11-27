@@ -4,15 +4,20 @@
         "outFile": "../../built/local/compiler.js"
     },
 
-    "references": [],
+    "references": [
+        { "path": "../shims" },
+    ],
 
     "files": [
         "core.ts",
+        "debug.ts",
         "performance.ts",
+        "perfLogger.ts",
         "semver.ts",
 
         "types.ts",
         "sys.ts",
+        "path.ts",
         "diagnosticInformationMap.generated.ts",
         "scanner.ts",
         "utilities.ts",
@@ -29,7 +34,10 @@
         "transformers/utilities.ts",
         "transformers/destructuring.ts",
         "transformers/ts.ts",
+        "transformers/classFields.ts",
         "transformers/es2017.ts",
+        "transformers/es2018.ts",
+        "transformers/es2019.ts",
         "transformers/esnext.ts",
         "transformers/jsx.ts",
         "transformers/es2016.ts",
@@ -51,6 +59,5 @@
         "moduleSpecifiers.ts",
         "watch.ts",
         "tsbuild.ts",
-        "inspectValue.ts",
     ]
 }

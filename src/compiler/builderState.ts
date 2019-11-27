@@ -15,14 +15,32 @@ namespace ts {
 /*@internal*/
 namespace ts {
     export function getFileEmitOutput(program: Program, sourceFile: SourceFile, emitOnlyDtsFiles: boolean,
-        cancellationToken?: CancellationToken, customTransformers?: CustomTransformers): EmitOutput {
+        cancellationToken?: CancellationToken, customTransformers?: CustomTransformers, forceDtsEmit?: boolean): EmitOutput {
         const outputFiles: OutputFile[] = [];
-        const emitResult = program.emit(sourceFile, writeFile, cancellationToken, emitOnlyDtsFiles, customTransformers);
+        const emitResult = program.emit(sourceFile, writeFile, cancellationToken, emitOnlyDtsFiles, customTransformers, forceDtsEmit);
         return { outputFiles, emitSkipped: emitResult.emitSkipped, exportedModulesFromDeclarationEmit: emitResult.exportedModulesFromDeclarationEmit };
 
         function writeFile(fileName: string, text: string, writeByteOrderMark: boolean) {
             outputFiles.push({ name: fileName, writeByteOrderMark, text });
         }
+    }
+
+    export interface ReusableBuilderState {
+        /**
+         * Information of the file eg. its version, signature etc
+         */
+        fileInfos: ReadonlyMap<BuilderState.FileInfo>;
+        /**
+         * Contains the map of ReferencedSet=Referenced files of the file if module emit is enabled
+         * Otherwise undefined
+         * Thus non undefined value indicates, module emit
+         */
+        readonly referencedMap?: ReadonlyMap<BuilderState.ReferencedSet> | undefined;
+        /**
+         * Contains the map of exported modules ReferencedSet=exported module files from the file if module emit is enabled
+         * Otherwise undefined
+         */
+        readonly exportedModulesMap?: ReadonlyMap<BuilderState.ReferencedSet> | undefined;
     }
 
     export interface BuilderState {
@@ -50,11 +68,11 @@ namespace ts {
         /**
          * Cache of all files excluding default library file for the current program
          */
-        allFilesExcludingDefaultLibraryFile?: ReadonlyArray<SourceFile>;
+        allFilesExcludingDefaultLibraryFile?: readonly SourceFile[];
         /**
          * Cache of all the file names
          */
-        allFileNames?: ReadonlyArray<string>;
+        allFileNames?: readonly string[];
     }
 
     export function cloneMapOrUndefined<T>(map: ReadonlyMap<T> | undefined) {
@@ -196,14 +214,14 @@ namespace ts.BuilderState {
     /**
      * Returns true if oldState is reusable, that is the emitKind = module/non module has not changed
      */
-    export function canReuseOldState(newReferencedMap: ReadonlyMap<ReferencedSet> | undefined, oldState: Readonly<BuilderState> | undefined) {
+    export function canReuseOldState(newReferencedMap: ReadonlyMap<ReferencedSet> | undefined, oldState: Readonly<ReusableBuilderState> | undefined) {
         return oldState && !oldState.referencedMap === !newReferencedMap;
     }
 
     /**
      * Creates the state of file references and signature for the new program from oldState if it is safe
      */
-    export function create(newProgram: Program, getCanonicalFileName: GetCanonicalFileName, oldState?: Readonly<BuilderState>): BuilderState {
+    export function create(newProgram: Program, getCanonicalFileName: GetCanonicalFileName, oldState?: Readonly<ReusableBuilderState>): BuilderState {
         const fileInfos = createMap<FileInfo>();
         const referencedMap = newProgram.getCompilerOptions().module !== ModuleKind.None ? createMap<ReferencedSet>() : undefined;
         const exportedModulesMap = referencedMap ? createMap<ReferencedSet>() : undefined;
@@ -212,7 +230,7 @@ namespace ts.BuilderState {
 
         // Create the reference map, and set the file infos
         for (const sourceFile of newProgram.getSourceFiles()) {
-            const version = sourceFile.version;
+            const version = Debug.assertDefined(sourceFile.version, "Program intended to be used with Builder should have source files with versions set");
             const oldInfo = useOldState ? oldState!.fileInfos.get(sourceFile.path) : undefined;
             if (referencedMap) {
                 const newReferences = getReferencedFiles(newProgram, sourceFile, getCanonicalFileName);
@@ -266,7 +284,7 @@ namespace ts.BuilderState {
     /**
      * Gets the files affected by the path from the program
      */
-    export function getFilesAffectedBy(state: BuilderState, programOfThisState: Program, path: Path, cancellationToken: CancellationToken | undefined, computeHash: ComputeHash, cacheToUpdateSignature?: Map<string>, exportedModulesMapCache?: ComputingExportedModulesMap): ReadonlyArray<SourceFile> {
+    export function getFilesAffectedBy(state: BuilderState, programOfThisState: Program, path: Path, cancellationToken: CancellationToken | undefined, computeHash: ComputeHash, cacheToUpdateSignature?: Map<string>, exportedModulesMapCache?: ComputingExportedModulesMap): readonly SourceFile[] {
         // Since the operation could be cancelled, the signatures are always stored in the cache
         // They will be committed once it is safe to use them
         // eg when calling this api from tsserver, if there is no cancellation of the operation
@@ -303,7 +321,7 @@ namespace ts.BuilderState {
     /**
      * Returns if the shape of the signature has changed since last emit
      */
-    function updateShapeSignature(state: Readonly<BuilderState>, programOfThisState: Program, sourceFile: SourceFile, cacheToUpdateSignature: Map<string>, cancellationToken: CancellationToken | undefined, computeHash: ComputeHash, exportedModulesMapCache?: ComputingExportedModulesMap) {
+    export function updateShapeSignature(state: Readonly<BuilderState>, programOfThisState: Program, sourceFile: SourceFile, cacheToUpdateSignature: Map<string>, cancellationToken: CancellationToken | undefined, computeHash: ComputeHash, exportedModulesMapCache?: ComputingExportedModulesMap) {
         Debug.assert(!!sourceFile);
         Debug.assert(!exportedModulesMapCache || !!state.exportedModulesMap, "Compute visible to outside map only if visibleToOutsideReferencedMap present in the state");
 
@@ -326,9 +344,21 @@ namespace ts.BuilderState {
             }
         }
         else {
-            const emitOutput = getFileEmitOutput(programOfThisState, sourceFile, /*emitOnlyDtsFiles*/ true, cancellationToken);
-            if (emitOutput.outputFiles && emitOutput.outputFiles.length > 0) {
-                latestSignature = computeHash(emitOutput.outputFiles[0].text);
+            const emitOutput = getFileEmitOutput(
+                programOfThisState,
+                sourceFile,
+                /*emitOnlyDtsFiles*/ true,
+                cancellationToken,
+                /*customTransformers*/ undefined,
+                /*forceDtsEmit*/ true
+            );
+            const firstDts = emitOutput.outputFiles &&
+                programOfThisState.getCompilerOptions().declarationMap ?
+                emitOutput.outputFiles.length > 1 ? emitOutput.outputFiles[1] : undefined :
+                emitOutput.outputFiles.length > 0 ? emitOutput.outputFiles[0] : undefined;
+            if (firstDts) {
+                Debug.assert(fileExtensionIs(firstDts.name, Extension.Dts), "File extension for signature expected to be dts", () => `Found: ${getAnyExtensionFromPath(firstDts.name)} for ${firstDts.name}:: All output files: ${JSON.stringify(emitOutput.outputFiles.map(f => f.name))}`);
+                latestSignature = computeHash(firstDts.text);
                 if (exportedModulesMapCache && latestSignature !== prevSignature) {
                     updateExportedModules(sourceFile, emitOutput.exportedModulesFromDeclarationEmit, exportedModulesMapCache);
                 }
@@ -387,7 +417,7 @@ namespace ts.BuilderState {
     /**
      * Get all the dependencies of the sourceFile
      */
-    export function getAllDependencies(state: BuilderState, programOfThisState: Program, sourceFile: SourceFile): ReadonlyArray<string> {
+    export function getAllDependencies(state: BuilderState, programOfThisState: Program, sourceFile: SourceFile): readonly string[] {
         const compilerOptions = programOfThisState.getCompilerOptions();
         // With --out or --outFile all outputs go into single file, all files depend on each other
         if (compilerOptions.outFile || compilerOptions.out) {
@@ -409,8 +439,8 @@ namespace ts.BuilderState {
                 const references = state.referencedMap.get(path);
                 if (references) {
                     const iterator = references.keys();
-                    for (let { value, done } = iterator.next(); !done; { value, done } = iterator.next()) {
-                        queue.push(value as Path);
+                    for (let iterResult = iterator.next(); !iterResult.done; iterResult = iterator.next()) {
+                        queue.push(iterResult.value as Path);
                     }
                 }
             }
@@ -425,7 +455,7 @@ namespace ts.BuilderState {
     /**
      * Gets the names of all files from the program
      */
-    function getAllFileNames(state: BuilderState, programOfThisState: Program): ReadonlyArray<string> {
+    function getAllFileNames(state: BuilderState, programOfThisState: Program): readonly string[] {
         if (!state.allFileNames) {
             const sourceFiles = programOfThisState.getSourceFiles();
             state.allFileNames = sourceFiles === emptyArray ? emptyArray : sourceFiles.map(file => file.fileName);
@@ -436,7 +466,7 @@ namespace ts.BuilderState {
     /**
      * Gets the files referenced by the the file path
      */
-    function getReferencedByPaths(state: Readonly<BuilderState>, referencedFilePath: Path) {
+    export function getReferencedByPaths(state: Readonly<BuilderState>, referencedFilePath: Path) {
         return arrayFrom(mapDefinedIterator(state.referencedMap!.entries(), ([filePath, referencesInFile]) =>
             referencesInFile.has(referencedFilePath) ? filePath as Path : undefined
         ));
@@ -476,7 +506,7 @@ namespace ts.BuilderState {
     /**
      * Gets all files of the program excluding the default library file
      */
-    function getAllFilesExcludingDefaultLibraryFile(state: BuilderState, programOfThisState: Program, firstSourceFile: SourceFile): ReadonlyArray<SourceFile> {
+    function getAllFilesExcludingDefaultLibraryFile(state: BuilderState, programOfThisState: Program, firstSourceFile: SourceFile): readonly SourceFile[] {
         // Use cached result
         if (state.allFilesExcludingDefaultLibraryFile) {
             return state.allFilesExcludingDefaultLibraryFile;

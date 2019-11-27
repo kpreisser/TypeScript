@@ -1,5 +1,5 @@
 // Block scoped definitions work poorly for global variables, temporarily enable var
-/* tslint:disable:no-var-keyword */
+/* eslint-disable no-var */
 
 // this will work in the browser via browserify
 var _chai: typeof chai = require("chai");
@@ -16,7 +16,7 @@ var assert: typeof _chai.assert = _chai.assert;
         }
         assertDeepImpl(a, b, msg);
 
-        function arrayExtraKeysObject(a: ReadonlyArray<{} | null | undefined>): object {
+        function arrayExtraKeysObject(a: readonly ({} | null | undefined)[]): object {
             const obj: { [key: string]: {} | null | undefined } = {};
             for (const key in a) {
                 if (Number.isNaN(Number(key))) {
@@ -28,10 +28,11 @@ var assert: typeof _chai.assert = _chai.assert;
     };
 }
 
-var global: NodeJS.Global = Function("return this").call(undefined); // tslint:disable-line:function-constructor
+var global: NodeJS.Global = Function("return this").call(undefined); // eslint-disable-line no-new-func
 
 declare var window: {};
 declare var XMLHttpRequest: new() => XMLHttpRequest;
+
 interface XMLHttpRequest {
     readonly readyState: number;
     readonly responseText: string;
@@ -44,52 +45,25 @@ interface XMLHttpRequest {
     getResponseHeader(header: string): string | null;
     overrideMimeType(mime: string): void;
 }
-/* tslint:enable:no-var-keyword prefer-const */
+/* eslint-enable no-var */
 
 namespace Utils {
-    // Setup some globals based on the current environment
-    export const enum ExecutionEnvironment {
-        Node,
-        Browser,
-    }
-
-    export function getExecutionEnvironment() {
-        if (typeof window !== "undefined") {
-            return ExecutionEnvironment.Browser;
-        }
-        else {
-            return ExecutionEnvironment.Node;
-        }
-    }
-
-    export let currentExecutionEnvironment = getExecutionEnvironment();
-
     export function encodeString(s: string): string {
         return ts.sys.bufferFrom!(s).toString("utf8");
     }
 
     export function byteLength(s: string, encoding?: string): number {
         // stub implementation if Buffer is not available (in-browser case)
-        return Buffer.byteLength(s, encoding);
+        return Buffer.byteLength(s, encoding as ts.BufferEncoding | undefined);
     }
 
     export function evalFile(fileContents: string, fileName: string, nodeContext?: any) {
-        const environment = getExecutionEnvironment();
-        switch (environment) {
-            case ExecutionEnvironment.Browser:
-                eval(fileContents);
-                break;
-            case ExecutionEnvironment.Node:
-                const vm = require("vm");
-                if (nodeContext) {
-                    vm.runInNewContext(fileContents, nodeContext, fileName);
-                }
-                else {
-                    vm.runInThisContext(fileContents, fileName);
-                }
-                break;
-            default:
-                throw new Error("Unknown context");
+        const vm = require("vm");
+        if (nodeContext) {
+            vm.runInNewContext(fileContents, nodeContext, fileName);
+        }
+        else {
+            vm.runInThisContext(fileContents, fileName);
         }
     }
 
@@ -203,7 +177,7 @@ namespace Utils {
         return a !== undefined && typeof a.pos === "number";
     }
 
-    export function convertDiagnostics(diagnostics: ReadonlyArray<ts.Diagnostic>) {
+    export function convertDiagnostics(diagnostics: readonly ts.Diagnostic[]) {
         return diagnostics.map(convertDiagnostic);
     }
 
@@ -274,7 +248,7 @@ namespace Utils {
                 o.containsParseError = true;
             }
 
-            for (const propertyName of Object.getOwnPropertyNames(n) as ReadonlyArray<keyof ts.SourceFile | keyof ts.Identifier>) {
+            for (const propertyName of Object.getOwnPropertyNames(n) as readonly (keyof ts.SourceFile | keyof ts.Identifier)[]) {
                 switch (propertyName) {
                     case "parent":
                     case "symbol":
@@ -329,7 +303,7 @@ namespace Utils {
         }
     }
 
-    export function assertDiagnosticsEquals(array1: ReadonlyArray<ts.Diagnostic>, array2: ReadonlyArray<ts.Diagnostic>) {
+    export function assertDiagnosticsEquals(array1: readonly ts.Diagnostic[], array2: readonly ts.Diagnostic[]) {
         if (array1 === array2) {
             return;
         }
@@ -466,7 +440,7 @@ namespace Utils {
 }
 
 namespace Harness {
-    // tslint:disable-next-line:interface-name
+    // eslint-disable-next-line @typescript-eslint/interface-name-prefix
     export interface IO {
         newLine(): string;
         getCurrentDirectory(): string;
@@ -488,7 +462,7 @@ namespace Harness {
         getExecutingFilePath(): string;
         getWorkspaceRoot(): string;
         exit(exitCode?: number): void;
-        readDirectory(path: string, extension?: ReadonlyArray<string>, exclude?: ReadonlyArray<string>, include?: ReadonlyArray<string>, depth?: number): ReadonlyArray<string>;
+        readDirectory(path: string, extension?: readonly string[], exclude?: readonly string[], include?: readonly string[], depth?: number): readonly string[];
         getAccessibleFileSystemEntries(dirname: string): ts.FileSystemEntries;
         tryEnableSourceMapsForHost?(): void;
         getEnvironmentVariable?(name: string): string;
@@ -528,7 +502,7 @@ namespace Harness {
         }
 
         function enumerateTestFiles(runner: RunnerBase) {
-            return runner.enumerateTestFiles();
+            return runner.getTestFiles();
         }
 
         function listFiles(path: string, spec: RegExp, options: { recursive?: boolean } = {}) {
@@ -623,344 +597,11 @@ namespace Harness {
         };
     }
 
-    interface URL {
-        hash: string;
-        host: string;
-        hostname: string;
-        href: string;
-        password: string;
-        pathname: string;
-        port: string;
-        protocol: string;
-        search: string;
-        username: string;
-        toString(): string;
-    }
-
-    declare var URL: {
-        prototype: URL;
-        new(url: string, base?: string | URL): URL;
-    };
-
-    function createBrowserIO(): IO {
-        const serverRoot = new URL("http://localhost:8888/");
-
-        class HttpHeaders extends collections.SortedMap<string, string | string[]> {
-            constructor(template?: Record<string, string | string[]>) {
-                super(ts.compareStringsCaseInsensitive);
-                if (template) {
-                    for (const key in template) {
-                        if (ts.hasProperty(template, key)) {
-                            this.set(key, template[key]);
-                        }
-                    }
-                }
-            }
-
-            public static combine(left: HttpHeaders | undefined, right: HttpHeaders | undefined): HttpHeaders | undefined {
-                if (!left && !right) return undefined;
-                const headers = new HttpHeaders();
-                if (left) left.forEach((value, key) => { headers.set(key, value); });
-                if (right) right.forEach((value, key) => { headers.set(key, value); });
-                return headers;
-            }
-
-            public has(key: string) {
-                return super.has(key.toLowerCase());
-            }
-
-            public get(key: string) {
-                return super.get(key.toLowerCase());
-            }
-
-            public set(key: string, value: string | string[]) {
-                return super.set(key.toLowerCase(), value);
-            }
-
-            public delete(key: string) {
-                return super.delete(key.toLowerCase());
-            }
-
-            public writeRequestHeaders(xhr: XMLHttpRequest) {
-                this.forEach((values, key) => {
-                    if (key === "access-control-allow-origin" || key === "content-length") return;
-                    const value = Array.isArray(values) ? values.join(",") : values;
-                    if (key === "content-type") {
-                        xhr.overrideMimeType(value);
-                        return;
-                    }
-                    xhr.setRequestHeader(key, value);
-                });
-            }
-
-            public static readResponseHeaders(xhr: XMLHttpRequest): HttpHeaders {
-                const allHeaders = xhr.getAllResponseHeaders();
-                const headers = new HttpHeaders();
-                for (const header of allHeaders.split(/\r\n/g)) {
-                    const colonIndex = header.indexOf(":");
-                    if (colonIndex >= 0) {
-                        const key = header.slice(0, colonIndex).trim();
-                        const value = header.slice(colonIndex + 1).trim();
-                        const values = value.split(",");
-                        headers.set(key, values.length > 1 ? values : value);
-                    }
-                }
-                return headers;
-            }
-        }
-
-        class HttpContent {
-            public headers: HttpHeaders;
-            public content: string;
-
-            constructor(headers: HttpHeaders | Record<string, string | string[]>, content: string) {
-                this.headers = headers instanceof HttpHeaders ? headers : new HttpHeaders(headers);
-                this.content = content;
-            }
-
-            public static fromMediaType(mediaType: string, content: string) {
-                return new HttpContent({ "Content-Type": mediaType }, content);
-            }
-
-            public static text(content: string) {
-                return HttpContent.fromMediaType("text/plain", content);
-            }
-
-            public static json(content: object) {
-                return HttpContent.fromMediaType("application/json", JSON.stringify(content));
-            }
-
-            public static readResponseContent(xhr: XMLHttpRequest) {
-                if (typeof xhr.responseText === "string") {
-                    return new HttpContent({
-                        "Content-Type": xhr.getResponseHeader("Content-Type") || undefined!, // TODO: GH#18217
-                        "Content-Length": xhr.getResponseHeader("Content-Length") || undefined!, // TODO: GH#18217
-                    }, xhr.responseText);
-                }
-                return undefined;
-            }
-
-            public writeRequestHeaders(xhr: XMLHttpRequest) {
-                this.headers.writeRequestHeaders(xhr);
-            }
-        }
-
-        class HttpRequestMessage {
-            public method: string;
-            public url: URL;
-            public headers: HttpHeaders;
-            public content?: HttpContent;
-
-            constructor(method: string, url: string | URL, headers?: HttpHeaders | Record<string, string | string[]>, content?: HttpContent) {
-                this.method = method;
-                this.url = typeof url === "string" ? new URL(url) : url;
-                this.headers = headers instanceof HttpHeaders ? headers : new HttpHeaders(headers);
-                this.content = content;
-            }
-
-            public static options(url: string | URL) {
-                return new HttpRequestMessage("OPTIONS", url);
-            }
-
-            public static head(url: string | URL) {
-                return new HttpRequestMessage("HEAD", url);
-            }
-
-            public static get(url: string | URL) {
-                return new HttpRequestMessage("GET", url);
-            }
-
-            public static delete(url: string | URL) {
-                return new HttpRequestMessage("DELETE", url);
-            }
-
-            public static put(url: string | URL, content: HttpContent) {
-                return new HttpRequestMessage("PUT", url, /*headers*/ undefined, content);
-            }
-
-            public static post(url: string | URL, content: HttpContent) {
-                return new HttpRequestMessage("POST", url, /*headers*/ undefined, content);
-            }
-
-            public writeRequestHeaders(xhr: XMLHttpRequest) {
-                this.headers.writeRequestHeaders(xhr);
-                if (this.content) {
-                    this.content.writeRequestHeaders(xhr);
-                }
-            }
-        }
-
-        class HttpResponseMessage {
-            public statusCode: number;
-            public statusMessage: string;
-            public headers: HttpHeaders;
-            public content?: HttpContent;
-
-            constructor(statusCode: number, statusMessage: string, headers?: HttpHeaders | Record<string, string | string[]>, content?: HttpContent) {
-                this.statusCode = statusCode;
-                this.statusMessage = statusMessage;
-                this.headers = headers instanceof HttpHeaders ? headers : new HttpHeaders(headers);
-                this.content = content;
-            }
-
-            public static notFound(): HttpResponseMessage {
-                return new HttpResponseMessage(404, "Not Found");
-            }
-
-            public static hasSuccessStatusCode(response: HttpResponseMessage) {
-                return response.statusCode === 304 || (response.statusCode >= 200 && response.statusCode < 300);
-            }
-
-            public static readResponseMessage(xhr: XMLHttpRequest) {
-                return new HttpResponseMessage(
-                    xhr.status,
-                    xhr.statusText,
-                    HttpHeaders.readResponseHeaders(xhr),
-                    HttpContent.readResponseContent(xhr));
-            }
-        }
-
-        function send(request: HttpRequestMessage): HttpResponseMessage {
-            const xhr = new XMLHttpRequest();
-            try {
-                xhr.open(request.method, request.url.toString(), /*async*/ false);
-                request.writeRequestHeaders(xhr);
-                xhr.setRequestHeader("Access-Control-Allow-Origin", "*");
-                xhr.send(request.content && request.content.content);
-                while (xhr.readyState !== 4); // block until ready
-                return HttpResponseMessage.readResponseMessage(xhr);
-            }
-            catch (e) {
-                return HttpResponseMessage.notFound();
-            }
-        }
-
-        let caseSensitivity: "CI" | "CS" | undefined;
-
-        function useCaseSensitiveFileNames() {
-            if (!caseSensitivity) {
-                const response = send(HttpRequestMessage.options(new URL("*", serverRoot)));
-                const xCaseSensitivity = response.headers.get("X-Case-Sensitivity");
-                caseSensitivity = xCaseSensitivity === "CS" ? "CS" : "CI";
-            }
-            return caseSensitivity === "CS";
-        }
-
-        function resolvePath(path: string) {
-            const response = send(HttpRequestMessage.post(new URL("/api/resolve", serverRoot), HttpContent.text(path)));
-            return HttpResponseMessage.hasSuccessStatusCode(response) && response.content ? response.content.content : undefined;
-        }
-
-        function getFileSize(path: string): number {
-            const response = send(HttpRequestMessage.head(new URL(path, serverRoot)));
-            return HttpResponseMessage.hasSuccessStatusCode(response) ? +response.headers.get("Content-Length")!.toString() : 0;
-        }
-
-        function readFile(path: string): string | undefined {
-            const response = send(HttpRequestMessage.get(new URL(path, serverRoot)));
-            return HttpResponseMessage.hasSuccessStatusCode(response) && response.content ? response.content.content : undefined;
-        }
-
-        function writeFile(path: string, contents: string) {
-            send(HttpRequestMessage.put(new URL(path, serverRoot), HttpContent.text(contents)));
-        }
-
-        function fileExists(path: string): boolean {
-            const response = send(HttpRequestMessage.head(new URL(path, serverRoot)));
-            return HttpResponseMessage.hasSuccessStatusCode(response);
-        }
-
-        function directoryExists(path: string): boolean {
-            const response = send(HttpRequestMessage.post(new URL("/api/directoryExists", serverRoot), HttpContent.text(path)));
-            return hasJsonContent(response) && JSON.parse(response.content.content) as boolean;
-        }
-
-        function deleteFile(path: string) {
-            send(HttpRequestMessage.delete(new URL(path, serverRoot)));
-        }
-
-        function directoryName(path: string) {
-            const url = new URL(path, serverRoot);
-            return ts.getDirectoryPath(ts.normalizeSlashes(url.pathname || "/"));
-        }
-
-        function enumerateTestFiles(runner: RunnerBase): (string | FileBasedTest)[] {
-            const response = send(HttpRequestMessage.post(new URL("/api/enumerateTestFiles", serverRoot), HttpContent.text(runner.kind())));
-            return hasJsonContent(response) ? JSON.parse(response.content.content) : [];
-        }
-
-        function listFiles(dirname: string, spec?: RegExp, options?: { recursive?: boolean }): string[] {
-            if (spec || (options && !options.recursive)) {
-                let results = IO.listFiles(dirname);
-                if (spec) {
-                    results = results.filter(file => spec.test(file));
-                }
-                if (options && !options.recursive) {
-                    results = results.filter(file => ts.getDirectoryPath(ts.normalizeSlashes(file)) === dirname);
-                }
-                return results;
-            }
-
-            const response = send(HttpRequestMessage.post(new URL("/api/listFiles", serverRoot), HttpContent.text(dirname)));
-            return hasJsonContent(response) ? JSON.parse(response.content.content) : [];
-        }
-
-        function readDirectory(path: string, extension?: string[], exclude?: string[], include?: string[], depth?: number) {
-            return ts.matchFiles(path, extension, exclude, include, useCaseSensitiveFileNames(), "", depth, getAccessibleFileSystemEntries);
-        }
-
-        function getAccessibleFileSystemEntries(dirname: string): ts.FileSystemEntries {
-            const response = send(HttpRequestMessage.post(new URL("/api/getAccessibleFileSystemEntries", serverRoot), HttpContent.text(dirname)));
-            return hasJsonContent(response) ? JSON.parse(response.content.content) : { files: [], directories: [] };
-        }
-
-        function hasJsonContent(response: HttpResponseMessage): response is HttpResponseMessage & { content: HttpContent } {
-            return HttpResponseMessage.hasSuccessStatusCode(response)
-                && !!response.content
-                && /^application\/json(;.*)$/.test("" + response.content.headers.get("Content-Type"));
-        }
-
-        return {
-            newLine: () => harnessNewLine,
-            getCurrentDirectory: () => "",
-            useCaseSensitiveFileNames,
-            resolvePath,
-            getFileSize,
-            readFile,
-            writeFile,
-            directoryName: Utils.memoize(directoryName, path => path),
-            getDirectories: () => [],
-            createDirectory: () => {}, // tslint:disable-line no-empty
-            fileExists,
-            directoryExists,
-            deleteFile,
-            listFiles: Utils.memoize(listFiles, (path, spec, options) => `${path}|${spec}|${options ? options.recursive === true : true}`),
-            enumerateTestFiles: Utils.memoize(enumerateTestFiles, runner => runner.kind()),
-            log: s => console.log(s),
-            args: () => [],
-            getExecutingFilePath: () => "",
-            exit: () => {}, // tslint:disable-line no-empty
-            readDirectory,
-            getAccessibleFileSystemEntries,
-            getWorkspaceRoot: () => "/"
-        };
-    }
-
     export function mockHash(s: string): string {
         return `hash-${s}`;
     }
 
-    const environment = Utils.getExecutionEnvironment();
-    switch (environment) {
-        case Utils.ExecutionEnvironment.Node:
-            IO = createNodeIO();
-            break;
-        case Utils.ExecutionEnvironment.Browser:
-            IO = createBrowserIO();
-            break;
-        default:
-            throw new Error(`Unknown value '${environment}' for ExecutionEnvironment.`);
-    }
+    IO = createNodeIO();
 }
 
 if (Harness.IO.tryEnableSourceMapsForHost && /^development$/i.test(Harness.IO.getEnvironmentVariable!("NODE_ENV"))) {
@@ -969,10 +610,8 @@ if (Harness.IO.tryEnableSourceMapsForHost && /^development$/i.test(Harness.IO.ge
 
 namespace Harness {
     export const libFolder = "built/local/";
-    const tcServicesFileName = ts.combinePaths(libFolder, Utils.getExecutionEnvironment() === Utils.ExecutionEnvironment.Browser ? "typescriptServicesInBrowserTest.js" : "typescriptServices.js");
-    export const tcServicesFile = IO.readFile(tcServicesFileName) + (Utils.getExecutionEnvironment() !== Utils.ExecutionEnvironment.Browser
-        ? IO.newLine() + `//# sourceURL=${IO.resolvePath(tcServicesFileName)}`
-        : "");
+    const tcServicesFileName = ts.combinePaths(libFolder, "typescriptServices.js");
+    export const tcServicesFile = IO.readFile(tcServicesFileName) + IO.newLine() + `//# sourceURL=${IO.resolvePath(tcServicesFileName)}`;
 
     export type SourceMapEmitterCallback = (
         emittedFile: string,
@@ -985,8 +624,10 @@ namespace Harness {
     ) => void;
 
     // Settings
+    /* eslint-disable prefer-const */
     export let userSpecifiedRoot = "";
     export let lightMode = false;
+    /* eslint-enable prefer-const */
 
     /** Functionality for compiling TypeScript code */
     export namespace Compiler {
@@ -1088,6 +729,7 @@ namespace Harness {
             includeBuiltFile?: string;
             baselineFile?: string;
             libFiles?: string;
+            noTypesAndSymbols?: boolean;
         }
 
         // Additional options not already in ts.optionDeclarations
@@ -1104,6 +746,7 @@ namespace Harness {
             { name: "currentDirectory", type: "string" },
             { name: "symlink", type: "string" },
             { name: "link", type: "string" },
+            { name: "noTypesAndSymbols", type: "boolean" },
             // Emitted js baseline will print full paths for every output file
             { name: "fullEmitPaths", type: "boolean" }
         ];
@@ -1193,7 +836,7 @@ namespace Harness {
                 setCompilerOptionsFromHarnessSetting(harnessSettings, options);
             }
             if (options.rootDirs) {
-                options.rootDirs = ts.map(options.rootDirs, d => ts.getNormalizedAbsolutePath(d, currentDirectory!));
+                options.rootDirs = ts.map(options.rootDirs, d => ts.getNormalizedAbsolutePath(d, currentDirectory));
             }
 
             const useCaseSensitiveFileNames = options.useCaseSensitiveFileNames !== undefined ? options.useCaseSensitiveFileNames : true;
@@ -1231,8 +874,8 @@ namespace Harness {
             currentDirectory: string;
         }
 
-        export function prepareDeclarationCompilationContext(inputFiles: ReadonlyArray<TestFile>,
-            otherFiles: ReadonlyArray<TestFile>,
+        export function prepareDeclarationCompilationContext(inputFiles: readonly TestFile[],
+            otherFiles: readonly TestFile[],
             result: compiler.CompilationResult,
             harnessSettings: TestCaseParser.CompilerSettings & HarnessOptions,
             options: ts.CompilerOptions,
@@ -1245,7 +888,7 @@ namespace Harness {
                         throw new Error("Only declaration files should be generated when emitDeclarationOnly:true");
                     }
                 }
-                else if (result.dts.size !== result.getNumberOfJsFiles()) {
+                else if (result.dts.size !== result.getNumberOfJsFiles(/*includeJson*/ true)) {
                     throw new Error("There were no errors and declFiles generated did not match number of js files generated");
                 }
             }
@@ -1264,7 +907,7 @@ namespace Harness {
                 if (vpath.isDeclaration(file.unitName) || vpath.isJson(file.unitName)) {
                     dtsFiles.push(file);
                 }
-                else if (vpath.isTypeScript(file.unitName)) {
+                else if (vpath.isTypeScript(file.unitName) || (vpath.isJavaScript(file.unitName) && options.allowJs)) {
                     const declFile = findResultCodeFile(file.unitName);
                     if (declFile && !findUnit(declFile.file, declInputFiles) && !findUnit(declFile.file, declOtherFiles)) {
                         dtsFiles.push({ unitName: declFile.file, content: utils.removeByteOrderMark(declFile.text) });
@@ -1311,12 +954,12 @@ namespace Harness {
             return { declInputFiles, declOtherFiles, declResult: output };
         }
 
-        export function minimalDiagnosticsToString(diagnostics: ReadonlyArray<ts.Diagnostic>, pretty?: boolean) {
+        export function minimalDiagnosticsToString(diagnostics: readonly ts.Diagnostic[], pretty?: boolean) {
             const host = { getCanonicalFileName, getCurrentDirectory: () => "", getNewLine: () => IO.newLine() };
             return (pretty ? ts.formatDiagnosticsWithColorAndContext : ts.formatDiagnostics)(diagnostics, host);
         }
 
-        export function getErrorBaseline(inputFiles: ReadonlyArray<TestFile>, diagnostics: ReadonlyArray<ts.Diagnostic>, pretty?: boolean) {
+        export function getErrorBaseline(inputFiles: readonly TestFile[], diagnostics: readonly ts.Diagnostic[], pretty?: boolean) {
             let outputLines = "";
             const gen = iterateErrorBaseline(inputFiles, diagnostics, { pretty });
             for (let {done, value} = gen.next(); !done; { done, value } = gen.next()) {
@@ -1331,7 +974,7 @@ namespace Harness {
 
         export const diagnosticSummaryMarker = "__diagnosticSummary";
         export const globalErrorsMarker = "__globalErrors";
-        export function *iterateErrorBaseline(inputFiles: ReadonlyArray<TestFile>, diagnostics: ReadonlyArray<ts.Diagnostic>, options?: { pretty?: boolean, caseSensitive?: boolean, currentDirectory?: string }): IterableIterator<[string, string, number]> {
+        export function *iterateErrorBaseline(inputFiles: readonly TestFile[], diagnostics: readonly ts.Diagnostic[], options?: { pretty?: boolean, caseSensitive?: boolean, currentDirectory?: string }): IterableIterator<[string, string, number]> {
             diagnostics = ts.sort(diagnostics, ts.compareDiagnostics);
             let outputLines = "";
             // Count up all errors that were found in files other than lib.d.ts so we don't miss any
@@ -1483,10 +1126,9 @@ namespace Harness {
             assert.equal(totalErrorsReportedInNonLibraryFiles + numLibraryDiagnostics + numTest262HarnessDiagnostics, diagnostics.length, "total number of errors");
         }
 
-        export function doErrorBaseline(baselinePath: string, inputFiles: ReadonlyArray<TestFile>, errors: ReadonlyArray<ts.Diagnostic>, pretty?: boolean) {
+        export function doErrorBaseline(baselinePath: string, inputFiles: readonly TestFile[], errors: readonly ts.Diagnostic[], pretty?: boolean) {
             Baseline.runBaseline(baselinePath.replace(/\.tsx?$/, ".errors.txt"),
-                // tslint:disable-next-line no-null-keyword
-                !errors || (errors.length === 0) ? null : getErrorBaseline(inputFiles, errors, pretty));
+                !errors || (errors.length === 0) ? null : getErrorBaseline(inputFiles, errors, pretty)); // eslint-disable-line no-null/no-null
         }
 
         export function doTypeAndSymbolBaseline(baselinePath: string, program: ts.Program, allFiles: {unitName: string, content: string}[], opts?: Baseline.BaselineOptions, multifile?: boolean, skipTypeBaselines?: boolean, skipSymbolBaselines?: boolean, hasErrorBaseline?: boolean) {
@@ -1564,9 +1206,7 @@ namespace Harness {
                     const [, content] = value;
                     result += content;
                 }
-                /* tslint:disable:no-null-keyword */
-                return result || null;
-                /* tslint:enable:no-null-keyword */
+                return result || null; // eslint-disable-line no-null/no-null
             }
 
             function *iterateBaseLine(isSymbolBaseline: boolean, skipBaseline?: boolean): IterableIterator<[string, string]> {
@@ -1629,7 +1269,7 @@ namespace Harness {
                 return;
             }
             else if (options.sourceMap || declMaps) {
-                if (result.maps.size !== (result.getNumberOfJsFiles() * (declMaps && options.sourceMap ? 2 : 1))) {
+                if (result.maps.size !== ((options.sourceMap ? result.getNumberOfJsFiles(/*includeJson*/ false) : 0) + (declMaps ? result.getNumberOfJsFiles(/*includeJson*/ true) : 0))) {
                     throw new Error("Number of sourcemap files should be same as js files.");
                 }
 
@@ -1637,9 +1277,7 @@ namespace Harness {
                 if ((options.noEmitOnError && result.diagnostics.length !== 0) || result.maps.size === 0) {
                     // We need to return null here or the runBaseLine will actually create a empty file.
                     // Baselining isn't required here because there is no output.
-                    /* tslint:disable:no-null-keyword */
-                    sourceMapCode = null;
-                    /* tslint:enable:no-null-keyword */
+                    sourceMapCode = null; // eslint-disable-line no-null/no-null
                 }
                 else {
                     sourceMapCode = "";
@@ -1652,7 +1290,7 @@ namespace Harness {
             }
         }
 
-        export function doJsEmitBaseline(baselinePath: string, header: string, options: ts.CompilerOptions, result: compiler.CompilationResult, tsConfigFiles: ReadonlyArray<TestFile>, toBeCompiled: ReadonlyArray<TestFile>, otherFiles: ReadonlyArray<TestFile>, harnessSettings: TestCaseParser.CompilerSettings) {
+        export function doJsEmitBaseline(baselinePath: string, header: string, options: ts.CompilerOptions, result: compiler.CompilationResult, tsConfigFiles: readonly TestFile[], toBeCompiled: readonly TestFile[], otherFiles: readonly TestFile[], harnessSettings: TestCaseParser.CompilerSettings) {
             if (!options.noEmit && !options.emitDeclarationOnly && result.js.size === 0 && result.diagnostics.length === 0) {
                 throw new Error("Expected at least one js file to be emitted or at least one error to be created.");
             }
@@ -1672,6 +1310,13 @@ namespace Harness {
             result.js.forEach(file => {
                 if (jsCode.length && jsCode.charCodeAt(jsCode.length - 1) !== ts.CharacterCodes.lineFeed) {
                     jsCode += "\r\n";
+                }
+                if (!result.diagnostics.length && !ts.endsWith(file.file, ts.Extension.Json)) {
+                    const fileParseResult = ts.createSourceFile(file.file, file.text, options.target || ts.ScriptTarget.ES3, /*parentNodes*/ false, ts.endsWith(file.file, "x") ? ts.ScriptKind.JSX : ts.ScriptKind.JS);
+                    if (ts.length(fileParseResult.parseDiagnostics)) {
+                        jsCode += getErrorBaseline([file.asTestFile()], fileParseResult.parseDiagnostics);
+                        return;
+                    }
                 }
                 jsCode += fileOutput(file, harnessSettings);
             });
@@ -1694,7 +1339,8 @@ namespace Harness {
                 jsCode += getErrorBaseline(tsConfigFiles.concat(declFileCompilationResult.declInputFiles, declFileCompilationResult.declOtherFiles), declFileCompilationResult.declResult.diagnostics);
             }
 
-            Baseline.runBaseline(baselinePath.replace(/\.tsx?/, ts.Extension.Js), jsCode.length > 0 ? tsCode + "\r\n\r\n" + jsCode : null); // tslint:disable-line no-null-keyword
+            // eslint-disable-next-line no-null/no-null
+            Baseline.runBaseline(baselinePath.replace(/\.tsx?/, ts.Extension.Js), jsCode.length > 0 ? tsCode + "\r\n\r\n" + jsCode : null);
         }
 
         function fileOutput(file: documents.TextDocument, harnessSettings: TestCaseParser.CompilerSettings): string {
@@ -1702,7 +1348,7 @@ namespace Harness {
             return "//// [" + fileName + "]\r\n" + utils.removeTestPathPrefixes(file.text);
         }
 
-        export function collateOutputs(outputFiles: ReadonlyArray<documents.TextDocument>): string {
+        export function collateOutputs(outputFiles: readonly documents.TextDocument[]): string {
             const gen = iterateOutputs(outputFiles);
             // Emit them
             let result = "";
@@ -1766,10 +1412,65 @@ namespace Harness {
         [key: string]: string;
     }
 
-    function splitVaryBySettingValue(text: string): string[] | undefined {
+    function splitVaryBySettingValue(text: string, varyBy: string): string[] | undefined {
         if (!text) return undefined;
-        const entries = text.split(/,/).map(s => s.trim().toLowerCase()).filter(s => s.length > 0);
-        return entries && entries.length > 1 ? entries : undefined;
+
+        let star = false;
+        const includes: string[] = [];
+        const excludes: string[] = [];
+        for (let s of text.split(/,/g)) {
+            s = s.trim().toLowerCase();
+            if (s.length === 0) continue;
+            if (s === "*") {
+                star = true;
+            }
+            else if (ts.startsWith(s, "-") || ts.startsWith(s, "!")) {
+                excludes.push(s.slice(1));
+            }
+            else {
+                includes.push(s);
+            }
+        }
+
+        // do nothing if the setting has no variations
+        if (includes.length <= 1 && !star && excludes.length === 0) {
+            return undefined;
+        }
+
+        const variations: { key: string, value?: string | number }[] = [];
+        const values = getVaryByStarSettingValues(varyBy);
+
+        // add (and deduplicate) all included entries
+        for (const include of includes) {
+            const value = values?.get(include);
+            if (ts.findIndex(variations, v => v.key === include || value !== undefined && v.value === value) === -1) {
+                variations.push({ key: include, value });
+            }
+        }
+
+        if (star && values) {
+            // add all entries
+            for (const [key, value] of ts.arrayFrom(values.entries())) {
+                if (ts.findIndex(variations, v => v.key === key || v.value === value) === -1) {
+                    variations.push({ key, value });
+                }
+            }
+        }
+
+        // remove all excluded entries
+        for (const exclude of excludes) {
+            const value = values?.get(exclude);
+            let index: number;
+            while ((index = ts.findIndex(variations, v => v.key === exclude || value !== undefined && v.value === value)) >= 0) {
+                ts.orderedRemoveItemAt(variations, index);
+            }
+        }
+
+        if (variations.length === 0) {
+            throw new Error(`Variations in test option '@${varyBy}' resulted in an empty set.`);
+        }
+
+        return ts.map(variations, v => v.key);
     }
 
     function computeFileBasedTestConfigurationVariations(configurations: FileBasedTestConfiguration[], variationState: FileBasedTestConfiguration, varyByEntries: [string, string[]][], offset: number) {
@@ -1787,17 +1488,37 @@ namespace Harness {
         }
     }
 
+    let booleanVaryByStarSettingValues: ts.Map<string | number> | undefined;
+
+    function getVaryByStarSettingValues(varyBy: string): ts.ReadonlyMap<string | number> | undefined {
+        const option = ts.forEach(ts.optionDeclarations, decl => ts.equateStringsCaseInsensitive(decl.name, varyBy) ? decl : undefined);
+        if (option) {
+            if (typeof option.type === "object") {
+                return option.type;
+            }
+            if (option.type === "boolean") {
+                return booleanVaryByStarSettingValues || (booleanVaryByStarSettingValues = ts.createMapFromTemplate({
+                    true: 1,
+                    false: 0
+                }));
+            }
+        }
+    }
+
     /**
      * Compute FileBasedTestConfiguration variations based on a supplied list of variable settings.
      */
-    export function getFileBasedTestConfigurations(settings: TestCaseParser.CompilerSettings, varyBy: string[]): FileBasedTestConfiguration[] | undefined {
+    export function getFileBasedTestConfigurations(settings: TestCaseParser.CompilerSettings, varyBy: readonly string[]): FileBasedTestConfiguration[] | undefined {
         let varyByEntries: [string, string[]][] | undefined;
+        let variationCount = 1;
         for (const varyByKey of varyBy) {
             if (ts.hasProperty(settings, varyByKey)) {
                 // we only consider variations when there are 2 or more variable entries.
-                const entries = splitVaryBySettingValue(settings[varyByKey]);
+                const entries = splitVaryBySettingValue(settings[varyByKey], varyByKey);
                 if (entries) {
                     if (!varyByEntries) varyByEntries = [];
+                    variationCount *= entries.length;
+                    if (variationCount > 25) throw new Error(`Provided test options exceeded the maximum number of variations: ${varyBy.map(v => `'@${v}'`).join(", ")}`);
                     varyByEntries.push([varyByKey, entries]);
                 }
             }
@@ -1848,9 +1569,7 @@ namespace Harness {
             const opts: CompilerSettings = {};
 
             let match: RegExpExecArray | null;
-            /* tslint:disable:no-null-keyword */
-            while ((match = optionRegex.exec(content)) !== null) {
-            /* tslint:enable:no-null-keyword */
+            while ((match = optionRegex.exec(content)) !== null) { // eslint-disable-line no-null/no-null
                 opts[match[1]] = match[2].trim();
             }
 
@@ -2028,9 +1747,8 @@ namespace Harness {
 
             const refFileName = referencePath(relativeFileName, opts && opts.Baselinefolder, opts && opts.Subfolder);
 
-            /* tslint:disable:no-null-keyword */
+            // eslint-disable-next-line no-null/no-null
             if (actual === null) {
-            /* tslint:enable:no-null-keyword */
                 actual = noContent;
             }
 
@@ -2093,7 +1811,8 @@ namespace Harness {
             const gen = generateContent();
             const writtenFiles = ts.createMap<true>();
             const errors: Error[] = [];
-            // tslint:disable-next-line:no-null-keyword
+
+            // eslint-disable-next-line no-null/no-null
             if (gen !== null) {
                 for (let {done, value} = gen.next(); !done; { done, value } = gen.next()) {
                     const [name, content, count] = value as [string, string, number | undefined];

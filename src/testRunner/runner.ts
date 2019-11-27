@@ -1,5 +1,7 @@
+/* eslint-disable prefer-const */
 let runners: RunnerBase[] = [];
 let iterations = 1;
+/* eslint-enable prefer-const */
 
 function runTests(runners: RunnerBase[]) {
     for (let i = iterations; i > 0; i--) {
@@ -40,6 +42,8 @@ function createRunner(kind: TestRunnerKind): RunnerBase {
             return new UserCodeRunner();
         case "dt":
             return new DefinitelyTypedRunner();
+        case "docker":
+            return new DockerfileRunner();
     }
     return ts.Debug.fail(`Unknown runner kind ${kind}`);
 }
@@ -50,7 +54,7 @@ const mytestconfigFileName = "mytest.config";
 const testconfigFileName = "test.config";
 
 const customConfig = tryGetConfig(Harness.IO.args());
-let testConfigContent =
+const testConfigContent =
     customConfig && Harness.IO.fileExists(customConfig)
         ? Harness.IO.readFile(customConfig)!
         : Harness.IO.fileExists(mytestconfigFileName)
@@ -76,6 +80,8 @@ interface TestConfig {
     noColors?: boolean;
     timeout?: number;
     keepFailed?: boolean;
+    shardId?: number;
+    shards?: number;
 }
 
 interface TaskSet {
@@ -107,6 +113,12 @@ function handleTestConfig() {
         if (testConfig.keepFailed) {
             keepFailed = true;
         }
+        if (testConfig.shardId) {
+            shardId = testConfig.shardId;
+        }
+        if (testConfig.shards) {
+            shards = testConfig.shards;
+        }
 
         if (testConfig.stackTraceLimit === "full") {
             (<any>Error).stackTraceLimit = Infinity;
@@ -122,6 +134,9 @@ function handleTestConfig() {
 
         const runnerConfig = testConfig.runners || testConfig.test;
         if (runnerConfig && runnerConfig.length > 0) {
+            if (testConfig.runners) {
+                runUnitTests = runnerConfig.indexOf("unittest") !== -1;
+            }
             for (const option of runnerConfig) {
                 if (!option) {
                     continue;
@@ -172,6 +187,9 @@ function handleTestConfig() {
                     case "dt":
                         runners.push(new DefinitelyTypedRunner());
                         break;
+                    case "docker":
+                        runners.push(new DockerfileRunner());
+                        break;
                 }
             }
         }
@@ -182,10 +200,7 @@ function handleTestConfig() {
         runners.push(new CompilerBaselineRunner(CompilerTestType.Conformance));
         runners.push(new CompilerBaselineRunner(CompilerTestType.Regressions));
 
-        // TODO: project tests don"t work in the browser yet
-        if (Utils.getExecutionEnvironment() !== Utils.ExecutionEnvironment.Browser) {
-            runners.push(new project.ProjectRunner());
-        }
+        runners.push(new project.ProjectRunner());
 
         // language services
         runners.push(new FourSlashRunner(FourSlash.FourSlashTestType.Native));
@@ -195,8 +210,9 @@ function handleTestConfig() {
         // runners.push(new GeneratedFourslashRunner());
 
         // CRON-only tests
-        if (Utils.getExecutionEnvironment() !== Utils.ExecutionEnvironment.Browser && process.env.TRAVIS_EVENT_TYPE === "cron") {
+        if (process.env.TRAVIS_EVENT_TYPE === "cron") {
             runners.push(new UserCodeRunner());
+            runners.push(new DockerfileRunner());
         }
     }
     if (runUnitTests === undefined) {
@@ -229,13 +245,11 @@ function beginTests() {
 let isWorker: boolean;
 function startTestEnvironment() {
     isWorker = handleTestConfig();
-    if (Utils.getExecutionEnvironment() !== Utils.ExecutionEnvironment.Browser) {
-        if (isWorker) {
-            return Harness.Parallel.Worker.start();
-        }
-        else if (taskConfigsFolder && workerCount && workerCount > 1) {
-            return Harness.Parallel.Host.start();
-        }
+    if (isWorker) {
+        return Harness.Parallel.Worker.start();
+    }
+    else if (taskConfigsFolder && workerCount && workerCount > 1) {
+        return Harness.Parallel.Host.start();
     }
     beginTests();
 }
