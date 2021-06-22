@@ -23,7 +23,7 @@ interface Array<T> {
     findIndex(predicate: (value: T, index: number, obj: T[]) => unknown, thisArg?: any): number;
 
     /**
-     * Returns the this object after filling the section identified by start and end with value
+     * Changes all array elements from `start` to `end` index to a static `value` and returns the modified array
      * @param value value to fill array section with
      * @param start index to start filling the array at. If start is negative, it is treated as
      * length+start where length is the length of the array.
@@ -42,15 +42,6 @@ interface Array<T> {
      * @param end If not specified, length of the this object is used as its default value.
      */
     copyWithin(target: number, start: number, end?: number): this;
-
-    /**
-     * Removes elements from an array and, if necessary, inserts new elements in their place, returning the deleted elements.
-     * @param start The zero-based location in the array from which to start removing elements.
-     * @param deleteCount The number of elements to remove. If deleteCount is omitted, or if its value is equal to or larger
-     * than array.length - start (that is, if it is equal to or greater than the number of elements left in the array,
-     * starting at start), then all the elements from start to the end of the array will be deleted.
-     */
-    splice(start: number, deleteCount?: number): T[];
 }
 
 interface ArrayConstructor {
@@ -257,8 +248,8 @@ interface NumberConstructor {
 
     /**
      * Converts A string to an integer.
-     * @param s A string to convert into a number.
-     * @param radix A value between 2 and 36 that specifies the base of the number in numString.
+     * @param string A string to convert into a number.
+     * @param radix A value between 2 and 36 that specifies the base of the number in `string`.
      * If this argument is not supplied, strings with a prefix of '0x' are considered hexadecimal.
      * All other strings are considered decimal.
      */
@@ -443,48 +434,48 @@ interface String {
     startsWith(searchString: string, position?: number): boolean;
 
     /**
-     * Returns an <a> HTML anchor element and sets the name attribute to the text value
+     * Returns an `<a>` HTML anchor element and sets the name attribute to the text value
      * @param name
      */
     anchor(name: string): string;
 
-    /** Returns a <big> HTML element */
+    /** Returns a `<big>` HTML element */
     big(): string;
 
-    /** Returns a <blink> HTML element */
+    /** Returns a `<blink>` HTML element */
     blink(): string;
 
-    /** Returns a <b> HTML element */
+    /** Returns a `<b>` HTML element */
     bold(): string;
 
-    /** Returns a <tt> HTML element */
+    /** Returns a `<tt>` HTML element */
     fixed(): string;
 
-    /** Returns a <font> HTML element and sets the color attribute value */
+    /** Returns a `<font>` HTML element and sets the color attribute value */
     fontcolor(color: string): string;
 
-    /** Returns a <font> HTML element and sets the size attribute value */
+    /** Returns a `<font>` HTML element and sets the size attribute value */
     fontsize(size: number): string;
 
-    /** Returns a <font> HTML element and sets the size attribute value */
+    /** Returns a `<font>` HTML element and sets the size attribute value */
     fontsize(size: string): string;
 
-    /** Returns an <i> HTML element */
+    /** Returns an `<i>` HTML element */
     italics(): string;
 
-    /** Returns an <a> HTML element and sets the href attribute value */
+    /** Returns an `<a>` HTML element and sets the href attribute value */
     link(url: string): string;
 
-    /** Returns a <small> HTML element */
+    /** Returns a `<small>` HTML element */
     small(): string;
 
-    /** Returns a <strike> HTML element */
+    /** Returns a `<strike>` HTML element */
     strike(): string;
 
-    /** Returns a <sub> HTML element */
+    /** Returns a `<sub>` HTML element */
     sub(): string;
 
-    /** Returns a <sup> HTML element */
+    /** Returns a `<sup>` HTML element */
     sup(): string;
 }
 
@@ -496,11 +487,13 @@ interface StringConstructor {
     fromCodePoint(...codePoints: number[]): string;
 
     /**
-     * String.raw is intended for use as a tag function of a Tagged Template String. When called
-     * as such the first argument will be a well formed template call site object and the rest
-     * parameter will contain the substitution values.
+     * String.raw is usually used as a tag function of a Tagged Template String. When called as
+     * such, the first argument will be a well formed template call site object and the rest
+     * parameter will contain the substitution values. It can also be called directly, for example,
+     * to interleave strings and values from your own tag function, and in this case the only thing
+     * it needs from the first argument is the raw property.
      * @param template A well-formed template string call site representation.
      * @param substitutions A set of substitution values.
      */
-    raw(template: TemplateStringsArray, ...substitutions: any[]): string;
+    raw(template: { raw: readonly string[] | ArrayLike<string>}, ...substitutions: any[]): string;
 }
